@@ -28,10 +28,10 @@ index 954017a..887a2ee 100644
  ID = ENB_RLC_DL
 diff --git a/common/utils/nr_sniffer_hooks.h b/common/utils/nr_sniffer_hooks.h
 new file mode 100644
-index 0000000..17f5cd2
+index 0000000..fb037a9
 --- /dev/null
 +++ b/common/utils/nr_sniffer_hooks.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,142 @@
 +/*
 + * SPDX-License-Identifier: LicenseRef-CSSL-1.0
 + */
@@ -74,11 +74,41 @@ index 0000000..17f5cd2
 +  bool fr2; ///< true if the SSB burst has 64 positions
 +} nr_sniffer_mib_t;
 +
++/// One DCI with the PDSCH/PUSCH allocation it schedules (the nr-sniffer DCI CSV schema).
++typedef struct {
++  uint64_t timestamp_us;
++  int sfn, slot; ///< frame and slot the PDCCH was received in
++  int rnti;
++  int rnti_type; ///< nr_rnti_type_t
++  int dci_format; ///< nr_dci_format_t
++  int bwp_id, coreset_id, ss_id;
++  int aggregation_level, cce_index;
++  int prb_start, prb_len; ///< prb_start relative to the BWP start
++  int mcs;
++  int mcs_table; ///< FAPI mcsTable / mcs_table index
++  int tbs_bits;
++  int ndi, rv, harq_id;
++} nr_sniffer_dci_t;
++
 +void nr_sniffer_init(configmodule_interface_t *cfg) __attribute__((weak));
 +void nr_sniffer_on_mib(const nr_sniffer_mib_t *mib) __attribute__((weak));
 +/// \p sib1 is a const NR_SIB1_t *; void * keeps this header free of ASN.1 includes.
 +void nr_sniffer_on_sib1(const void *sib1, int frame, int slot) __attribute__((weak));
 +bool nr_sniffer_is_passive(void) __attribute__((weak));
++/// UE MAC decoded a DCI (any RNTI) and prepared the PDSCH/PUSCH it schedules.
++void nr_sniffer_on_dci(const nr_sniffer_dci_t *dci) __attribute__((weak));
++/// UE PHY: true if a PDCCH candidate decoded with the configuration for \p cfg_rnti has a CRC remainder \p crc
++/// equal to an RNTI the sniffer tracks for that configuration (other UEs' RA-RNTI / TC-RNTI).
++bool nr_sniffer_match_rnti(uint16_t cfg_rnti, uint32_t crc) __attribute__((weak));
++/// UE MAC: nr_rnti_type_t of an RNTI the sniffer tracks, or -1.
++int nr_sniffer_rnti_type(uint16_t rnti) __attribute__((weak));
++/// UE MAC: RNTI to configure the RA search space with to watch other UEs' random access, or 0 for none.
++uint16_t nr_sniffer_ra_watch_rnti(void) __attribute__((weak));
++/// UE MAC: a RAR MAC PDU was decoded on a tracked RA-RNTI.
++void nr_sniffer_on_rar(const uint8_t *pdu, int len, int frame, int slot) __attribute__((weak));
++/// UE MAC: a UE Contention Resolution Identity MAC CE (Msg4) was decoded. Returns the TC-RNTI it was sent
++/// on if the sniffer adopts that UE (its C-RNTI and configuration become this MAC's), or 0.
++uint16_t nr_sniffer_on_contention_resolution(const uint8_t *cont_res_id, int frame, int slot) __attribute__((weak));
 +
 +static inline void nr_sniffer_hook_init(configmodule_interface_t *cfg)
 +{
@@ -98,10 +128,45 @@ index 0000000..17f5cd2
 +    nr_sniffer_on_sib1(sib1, frame, slot);
 +}
 +
-+/// True when running as a passive sniffer: the UE stack must never start random access.
++/// True when running as a passive sniffer: the UE stack must never start random access or transmit.
 +static inline bool nr_sniffer_passive(void)
 +{
 +  return nr_sniffer_is_passive && nr_sniffer_is_passive();
++}
++
++static inline void nr_sniffer_hook_dci(const nr_sniffer_dci_t *dci)
++{
++  if (nr_sniffer_on_dci)
++    nr_sniffer_on_dci(dci);
++}
++
++static inline bool nr_sniffer_hook_match_rnti(uint16_t cfg_rnti, uint32_t crc)
++{
++  return nr_sniffer_match_rnti && nr_sniffer_match_rnti(cfg_rnti, crc);
++}
++
++static inline int nr_sniffer_hook_rnti_type(uint16_t rnti)
++{
++  return nr_sniffer_rnti_type ? nr_sniffer_rnti_type(rnti) : -1;
++}
++
++static inline uint16_t nr_sniffer_hook_ra_watch_rnti(void)
++{
++  return nr_sniffer_ra_watch_rnti ? nr_sniffer_ra_watch_rnti() : 0;
++}
++
++/// Returns true if the sniffer consumed the RAR (the UE's own RA procedure must not process it).
++static inline bool nr_sniffer_hook_rar(const uint8_t *pdu, int len, int frame, int slot)
++{
++  if (!nr_sniffer_on_rar || !nr_sniffer_passive())
++    return false;
++  nr_sniffer_on_rar(pdu, len, frame, slot);
++  return true;
++}
++
++static inline uint16_t nr_sniffer_hook_contention_resolution(const uint8_t *cont_res_id, int frame, int slot)
++{
++  return nr_sniffer_on_contention_resolution ? nr_sniffer_on_contention_resolution(cont_res_id, frame, slot) : 0;
 +}
 +
 +#ifdef __cplusplus
@@ -129,8 +194,148 @@ index f9ebbc1..d18d412 100644
    CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
  
    softmodem_verify_mode(get_softmodem_params());
+diff --git a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h b/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
+index ea3b90f..7060317 100644
+--- a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
++++ b/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
+@@ -101,6 +101,9 @@ typedef struct {
+   // N_CCE is L, or number of CCEs for DCI
+   int N_CCE;
+   int cset_start;
++  // search space and CORESET the DCI was found in (copied from fapi_nr_dl_config_dci_dl_pdu_rel15_t)
++  int ss_id;
++  int coreset_id;
+   uint8_t payloadSize;
+   uint8_t payloadBits[16] __attribute__((aligned(16))); // will be cast as uint64
+ } fapi_nr_dci_indication_pdu_t;
+@@ -436,6 +439,8 @@ typedef struct {
+   uint8_t dci_length_options[2];
+   nfapi_nr_dci_formats_e dci_format_options[2];
+   uint8_t ss_type_options[2];
++  int ss_id; // searchSpaceId, reported back in the DCI indication
++  int coreset_id; // controlResourceSetId, reported back in the DCI indication
+ } fapi_nr_dl_config_dci_dl_pdu_rel15_t;
+ 
+ typedef struct {
+diff --git a/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c b/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
+index 2b773e3..7585368 100644
+--- a/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
++++ b/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
+@@ -13,6 +13,7 @@
+ 
+ 
+ #include "executables/softmodem-common.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include "nr_transport_proto_ue.h"
+ #include "PHY/CODING/nrPolar_tools/nr_polar_dci_defs.h"
+ #include "PHY/phy_extern.h"
+@@ -495,6 +496,9 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
+       const uint32_t crc = polar_decoder_int16(tmp_e, dci_estimation, 1, NR_POLAR_DCI_MESSAGE_TYPE, dci_length, L);
+ 
+       rnti_t n_rnti = rel15->rnti;
++      // nr-sniffer: also accept the candidate if its CRC remainder is another UE's RNTI that the sniffer tracks
++      if (crc != n_rnti && nr_sniffer_hook_match_rnti(rel15->rnti, crc))
++        n_rnti = crc;
+       if (crc == n_rnti) {
+         LOG_D(NR_PHY_DCI,
+               "(%i.%i) Received dci indication (rnti %x,dci format %d,n_CCE %d,payloadSize %d,payload %llx)\n",
+@@ -514,6 +518,8 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
+             .dci_format = rel15->dci_format_options[k],
+             .ss_type = rel15->ss_type_options[k],
+             .coreset_type = rel15->coreset.CoreSetType,
++            .ss_id = rel15->ss_id,
++            .coreset_id = rel15->coreset_id,
+         };
+         int n_rb, cset_start;
+         get_coreset_rballoc(rel15->coreset.frequency_domain_resource, &n_rb, &cset_start);
+diff --git a/openair1/SCHED_NR_UE/fapi_nr_ue_l1.c b/openair1/SCHED_NR_UE/fapi_nr_ue_l1.c
+index 1a8b22e..6e8c3da 100644
+--- a/openair1/SCHED_NR_UE/fapi_nr_ue_l1.c
++++ b/openair1/SCHED_NR_UE/fapi_nr_ue_l1.c
+@@ -8,6 +8,7 @@
+ 
+ #include <stdio.h>
+ #include "openair1/PHY/phy_extern_nr_ue.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include "fapi_nr_ue_interface.h"
+ #include "fapi_nr_ue_l1.h"
+ #include "harq_nr.h"
+@@ -303,6 +304,14 @@ static void nr_ue_scheduled_response_ul(PHY_VARS_NR_UE *phy, fapi_nr_ul_config_r
+     return;
+   }
+ 
++  // nr-sniffer: a passive sniffer never transmits (no PUSCH, PUCCH, PRACH or SRS reaches the PHY)
++  if (nr_sniffer_passive()) {
++    for (; pdu->pdu_type != FAPI_NR_END; pdu++)
++      pdu->pdu_type = FAPI_NR_UL_CONFIG_TYPE_DONE;
++    release_ul_config(pdu, true);
++    return;
++  }
++
+   while (pdu->pdu_type != FAPI_NR_END) {
+     switch (pdu->pdu_type) {
+       case FAPI_NR_UL_CONFIG_TYPE_PUSCH: {
+diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c b/openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c
+index b725793..a854191 100644
+--- a/openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c
++++ b/openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c
+@@ -11,6 +11,7 @@
+ 
+ /* MAC */
+ #include "NR_MAC_COMMON/nr_mac.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include "LAYER2/NR_MAC_UE/mac_proto.h"
+ #include <executables/softmodem-common.h>
+ #include "openair2/LAYER2/nr_rlc/nr_rlc_oai_api.h"
+@@ -1139,6 +1140,8 @@ void nr_rar_not_successful(NR_UE_MAC_INST_t *mac)
+ 
+ void trigger_MAC_UE_RA(NR_UE_MAC_INST_t *mac, dci_pdu_rel15_t *pdcch_order)
+ {
++  if (nr_sniffer_passive())
++    return; // nr-sniffer: a passive sniffer never transmits a preamble
+   LOG_W(NR_MAC, "Triggering new RA procedure for UE with RNTI %x\n", mac->crnti);
+   mac->state = UE_PERFORMING_RA;
+   reset_ra(mac, false);
+diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
+index ad89949..66dd5ec 100644
+--- a/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
++++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
+@@ -13,6 +13,7 @@
+ #include "common/utils/nr/nr_common.h"
+ #include "executables/softmodem-common.h"
+ #include "RRC/NR_UE/rrc_proto.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include <stdio.h>
+ 
+ static void fill_dci_search_candidates(const NR_SearchSpace_t *ss, fapi_nr_dl_config_dci_dl_pdu_rel15_t *rel15, const uint32_t Y)
+@@ -115,6 +116,8 @@ static void config_dci_pdu(NR_UE_MAC_INST_t *mac,
+   }
+ 
+   rel15->coreset.duration = coreset->duration;
++  rel15->coreset_id = coreset_id;
++  rel15->ss_id = ss->searchSpaceId;
+ 
+   for (int i = 0; i < 6; i++)
+     rel15->coreset.frequency_domain_resource[i] = coreset->frequencyDomainResources.buf[i];
+@@ -568,6 +571,16 @@ void ue_dci_configuration(NR_UE_MAC_INST_t *mac, fapi_nr_dl_config_request_t *dl
+     }
+   }
+   RA_config_t *ra = &mac->ra;
++  // nr-sniffer: monitor the RA search space for the RA-RNTIs and TC-RNTIs of other UEs' random access.
++  // ra->ra_rnti is one of the tracked RNTIs; the PHY accepts any of them (nr_sniffer_match_rnti).
++  const uint16_t sniffer_ra_rnti = nr_sniffer_hook_ra_watch_rnti();
++  if (sniffer_ra_rnti && mac->state != UE_PERFORMING_RA && pdcch_config->ra_SS_id >= 0) {
++    const NR_SearchSpace_t *ra_SS = get_common_search_space(mac, pdcch_config->ra_SS_id);
++    if (ra_SS && is_ss_monitor_occasion(frame, slot, slots_per_frame, ra_SS)) {
++      ra->ra_rnti = sniffer_ra_rnti;
++      config_dci_pdu(mac, dl_config, TYPE_RA_RNTI_, slot, ra_SS);
++    }
++  }
+   if (mac->state == UE_PERFORMING_RA && ra->ra_state >= nrRA_WAIT_RAR) {
+     const NR_SearchSpace_t *ra_SS = get_common_search_space(mac, pdcch_config->ra_SS_id);
+     // if RA is ongoing use RA search space
 diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
-index d7d1031..c08f7c1 100644
+index d7d1031..5fd01b0 100644
 --- a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
 +++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
 @@ -31,6 +31,7 @@
@@ -141,7 +346,19 @@ index d7d1031..c08f7c1 100644
  
  // #define DEBUG_MIB
  // #define ENABLE_MAC_PAYLOAD_DEBUG 1
-@@ -194,6 +195,22 @@ void nr_ue_decode_mib(NR_UE_MAC_INST_t *mac, int cc_id)
+@@ -127,7 +128,10 @@ int get_rnti_type(const NR_UE_MAC_INST_t *mac, const uint16_t rnti)
+   const RA_config_t *ra = &mac->ra;
+   nr_rnti_type_t rnti_type;
+ 
+-  if (rnti == ra->ra_rnti) {
++  const int sniffer_type = nr_sniffer_hook_rnti_type(rnti); // nr-sniffer: other UEs' RA-RNTI / TC-RNTI
++  if (sniffer_type >= 0 && rnti != mac->crnti) {
++    rnti_type = sniffer_type;
++  } else if (rnti == ra->ra_rnti) {
+     rnti_type = TYPE_RA_RNTI_;
+   } else if (rnti == ra->MsgB_rnti && (ra->ra_state == nrRA_WAIT_MSGB || ra->ra_state == nrRA_WAIT_CONTENTION_RESOLUTION)) {
+     rnti_type = TYPE_MSGB_RNTI_;
+@@ -194,6 +198,22 @@ void nr_ue_decode_mib(NR_UE_MAC_INST_t *mac, int cc_id)
    mac->ssb_subcarrier_offset = ssb_subcarrier_offset;
    mac->dmrs_TypeA_Position = mac->mib->dmrs_TypeA_Position;
  
@@ -164,6 +381,174 @@ index d7d1031..c08f7c1 100644
  }
  
  static void configure_ratematching_csi(fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_pdu,
+@@ -517,6 +537,44 @@ static void set_harq_status(NR_UE_MAC_INST_t *mac,
+         current_harq->dai_cumul);
+ }
+ 
++/* nr-sniffer: report a DCI that was processed successfully, with the PDSCH/PUSCH allocation it schedules */
++static void report_dci_to_sniffer(NR_UE_MAC_INST_t *mac,
++                                  frame_t frame,
++                                  int slot,
++                                  const fapi_nr_dci_indication_pdu_t *dci_ind,
++                                  const dci_pdu_rel15_t *dci,
++                                  nr_dci_format_t format,
++                                  int bwp_id,
++                                  int prb_start,
++                                  int prb_len,
++                                  int mcs_table,
++                                  int tbs_bits)
++{
++  if (!nr_sniffer_on_dci)
++    return;
++  const nr_sniffer_dci_t d = {
++      .sfn = frame,
++      .slot = slot,
++      .rnti = dci_ind->rnti,
++      .rnti_type = get_rnti_type(mac, dci_ind->rnti),
++      .dci_format = format,
++      .bwp_id = bwp_id,
++      .coreset_id = dci_ind->coreset_id,
++      .ss_id = dci_ind->ss_id,
++      .aggregation_level = dci_ind->N_CCE,
++      .cce_index = dci_ind->n_CCE,
++      .prb_start = prb_start,
++      .prb_len = prb_len,
++      .mcs = dci->mcs,
++      .mcs_table = mcs_table,
++      .tbs_bits = tbs_bits,
++      .ndi = dci->ndi,
++      .rv = dci->rv,
++      .harq_id = dci->harq_pid.val,
++  };
++  nr_sniffer_hook_dci(&d);
++}
++
+ static int nr_ue_process_dci_ul_00(NR_UE_MAC_INST_t *mac,
+                                    frame_t frame,
+                                    int slot,
+@@ -578,6 +636,18 @@ static int nr_ue_process_dci_ul_00(NR_UE_MAC_INST_t *mac,
+                                 NR_UL_DCI_FORMAT_0_0);
+   if (ret != 0)
+     remove_ul_config_last_item(pdu);
++  else
++    report_dci_to_sniffer(mac,
++                          frame,
++                          slot,
++                          dci_ind,
++                          dci,
++                          NR_UL_DCI_FORMAT_0_0,
++                          mac->current_UL_BWP->bwp_id,
++                          pdu->pusch_config_pdu.rb_start,
++                          pdu->pusch_config_pdu.rb_size,
++                          pdu->pusch_config_pdu.mcs_table,
++                          pdu->pusch_config_pdu.pusch_data.tb_size * 8);
+   release_ul_config(pdu, false);
+   return ret;
+ }
+@@ -683,6 +753,18 @@ static int nr_ue_process_dci_ul_01(NR_UE_MAC_INST_t *mac,
+         0);
+   if (ret != 0)
+     remove_ul_config_last_item(pdu);
++  else
++    report_dci_to_sniffer(mac,
++                          frame,
++                          slot,
++                          dci_ind,
++                          dci,
++                          NR_UL_DCI_FORMAT_0_1,
++                          mac->current_UL_BWP->bwp_id,
++                          pdu->pusch_config_pdu.rb_start,
++                          pdu->pusch_config_pdu.rb_size,
++                          pdu->pusch_config_pdu.mcs_table,
++                          pdu->pusch_config_pdu.pusch_data.tb_size * 8);
+   release_ul_config(pdu, false);
+   return ret;
+ }
+@@ -959,7 +1041,7 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
+   } else {
+     dlsch_pdu->SubcarrierSpacing = current_DL_BWP->scs;
+     if (rnti_type == TYPE_RA_RNTI_) {
+-      if (nr_timer_is_active(&mac->ra.response_window_timer)) {
++      if (nr_timer_is_active(&mac->ra.response_window_timer) || nr_sniffer_passive()) {
+         dl_conf_req->pdu_type = FAPI_NR_DL_CONFIG_TYPE_RA_DLSCH;
+       } else {
+         // Discard the DCI
+@@ -1230,6 +1312,17 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
+ 
+   LOG_D(MAC, "(nr_ue_procedures.c) pdu_type=%d\n", dl_conf_req->pdu_type);
+ 
++  report_dci_to_sniffer(mac,
++                        frame,
++                        slot,
++                        dci_ind,
++                        dci,
++                        NR_DL_DCI_FORMAT_1_0,
++                        current_DL_BWP ? current_DL_BWP->bwp_id : 0,
++                        dlsch_pdu->start_rb,
++                        dlsch_pdu->number_rbs,
++                        dlsch_pdu->mcs_table,
++                        dlsch_pdu->cw_info[0].TBS);
+   // the prepared dci is valid, we add it in the list
+   dl_config->number_pdus++;
+   return 0;
+@@ -1614,6 +1707,17 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
+   }
+   // the prepared dci is valid, we add it in the list
+   dl_conf_req->pdu_type = FAPI_NR_DL_CONFIG_TYPE_DLSCH;
++  report_dci_to_sniffer(mac,
++                        frame,
++                        slot,
++                        dci_ind,
++                        dci,
++                        NR_DL_DCI_FORMAT_1_1,
++                        current_DL_BWP->bwp_id,
++                        dlsch_pdu->start_rb,
++                        number_rbs,
++                        dlsch_pdu->mcs_table,
++                        dlsch_pdu->cw_info[0].TBS);
+   dl_config->number_pdus++; // The DCI configuration is valid, we add it in the list
+   return 0;
+ }
+@@ -3417,6 +3521,12 @@ static void nr_ue_process_rar(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *d
+     LOG_W(NR_MAC,"[UE %d][RAPROC][%d.%d] CRC check failed on RAR (NAK)\n", mac->ue_id, frame, slot);
+     return;
+   }
++  // nr-sniffer: RARs are for other UEs; the sniffer learns their TC-RNTIs from them
++  if (nr_sniffer_hook_rar(dl_info->rx_ind->rx_indication_body[pdu_id].pdsch_pdu.pdu,
++                          dl_info->rx_ind->rx_indication_body[pdu_id].pdsch_pdu.pdu_length,
++                          frame,
++                          slot))
++    return;
+ 
+   RA_config_t *ra = &mac->ra;
+   ra->t_crnti = 0;
+@@ -4297,6 +4407,15 @@ static void nr_ue_process_mac_pdu(NR_UE_MAC_INST_t *mac, nr_downlink_indication_
+             nr_ra_contention_resolution_failed(mac);
+             return;
+           }
++        } else {
++          // nr-sniffer: Msg4 of another UE. If the sniffer adopts it, its TC-RNTI becomes this MAC's C-RNTI and
++          // the RRCSetup in this PDU configures this MAC like that UE.
++          const uint16_t adopted = nr_sniffer_hook_contention_resolution(&pduP[1], frameP, slot);
++          if (adopted) {
++            ra->t_crnti = adopted;
++            nr_timer_start(&mac->time_alignment_timer);
++            nr_ra_succeeded(mac, frameP, slot);
++          }
+         }
+         break;
+       case DL_SCH_LCID_PADDING:
+@@ -4450,7 +4569,9 @@ void nr_ue_send_sdu(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info, in
+       if (mac->data_inactivity_timer)
+         nr_timer_start(mac->data_inactivity_timer);
+       // DL data arrival during RRC_CONNECTED when UL synchronisation status is "non-synchronised"
+-      if (!nr_timer_is_active(&mac->time_alignment_timer) && mac->state == UE_CONNECTED && !get_softmodem_params()->phy_test) {
++      // (not for a passive nr-sniffer, which never transmits and so needs no UL synchronisation)
++      if (!nr_timer_is_active(&mac->time_alignment_timer) && mac->state == UE_CONNECTED && !get_softmodem_params()->phy_test
++          && !nr_sniffer_passive()) {
+         trigger_MAC_UE_RA(mac, NULL);
+         break;
+       }
 diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c
 index 3a52e52..46e8c5e 100644
 --- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c

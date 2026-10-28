@@ -23,6 +23,8 @@
 #include "NR_SIB1.h"
 #include "NR_ServingCellConfigCommonSIB.h"
 #include "nr_sniffer_csv.h"
+#include "nr_sniffer_dci.h"
+#include "nr_sniffer_ra.h"
 
 #define SNIFFER_SECTION "sniffer"
 
@@ -35,11 +37,15 @@ static struct {
   int pci_filter;
   char *mcs_table;
   int dump_xml;
+  int follow_ue;
   /* outputs */
   nr_sniffer_csv_t mib_csv;
   nr_sniffer_csv_t sib1_csv;
+  nr_sniffer_csv_t dci_csv;
   /* state */
   int last_pci;
+  bool fr2;
+  uint64_t nb_dci;
   char last_mib_key[256];
   char last_sib1_key[1024];
   uint64_t nb_mib;
@@ -95,6 +101,8 @@ void nr_sniffer_init(configmodule_interface_t *cfg)
       STRINGPARAM("mcs_table", "MCS table assumed for DCI decoding: qam256 or qam64 (used from milestone 2)", 0,
                   &S.mcs_table, "qam256"),
       INTPARAM("dump_xml", "1: write each new SIB1 as ASN.1 XER to out_dir", PARAMFLAG_BOOL, &S.dump_xml, 1),
+      INTPARAM("follow_ue", "1: follow the first UE seen in random access and log its DCIs (default), 0: MIB/SIB1 only",
+               PARAMFLAG_BOOL, &S.follow_ue, 1),
   };
   config_get(cfg, params, sizeof(params) / sizeof(params[0]), SNIFFER_SECTION);
 
@@ -102,9 +110,11 @@ void nr_sniffer_init(configmodule_interface_t *cfg)
     fprintf(stderr, "[SNIFFER] cannot create output directory %s: %s\n", S.out_dir, strerror(errno));
   nr_sniffer_csv_open(&S.mib_csv, S.out_dir, "mib.csv", MIB_HEADER);
   nr_sniffer_csv_open(&S.sib1_csv, S.out_dir, "sib1.csv", SIB1_HEADER);
+  nr_sniffer_csv_open(&S.dci_csv, S.out_dir, "dci.csv", NR_SNIFFER_DCI_HEADER);
+  nr_sniffer_ra_init(S.out_dir, S.passive && S.follow_ue);
 
-  printf("[SNIFFER] nr-sniffer started: out_dir=%s passive=%d pci=%d mcs_table=%s\n",
-         S.out_dir, S.passive, S.pci_filter, S.mcs_table);
+  printf("[SNIFFER] nr-sniffer started: out_dir=%s passive=%d pci=%d mcs_table=%s follow_ue=%d\n",
+         S.out_dir, S.passive, S.pci_filter, S.mcs_table, S.follow_ue);
   fflush(stdout); /* [SNIFFER] lines are followed live through a pipe or file */
   S.initialized = true;
   pthread_mutex_unlock(&S.lock);
@@ -140,6 +150,7 @@ void nr_sniffer_on_mib(const nr_sniffer_mib_t *mib)
   pthread_mutex_lock(&S.lock);
   S.nb_mib++;
   S.last_pci = mib->pci;
+  S.fr2 = mib->fr2;
 
   if (pci_accepted(mib->pci)) {
     /* log the first MIB and every change of its static content */
@@ -319,6 +330,7 @@ void nr_sniffer_on_sib1(const void *sib1_ptr, int frame, int slot)
            pci, mcc, mnc, tac, (unsigned long)nci, band, carrier_bw, scs, bwp_start, bwp_size, prach_idx, tdd_period,
            tdd_dl_slots, tdd_ul_slots);
     fflush(stdout);
+    nr_sniffer_ra_configure(sib1, S.fr2);
     if (S.dump_xml) {
       char path[600];
       snprintf(path, sizeof(path), "%s/sib1_pci%d.xml", S.out_dir, pci);
@@ -329,5 +341,24 @@ void nr_sniffer_on_sib1(const void *sib1_ptr, int frame, int slot)
       }
     }
   }
+  pthread_mutex_unlock(&S.lock);
+}
+
+/* ------------------------------------------------------------------------- */
+/* DCI                                                                       */
+/* ------------------------------------------------------------------------- */
+
+void nr_sniffer_on_dci(const nr_sniffer_dci_t *dci)
+{
+  if (!S.initialized)
+    return;
+  nr_sniffer_ra_on_dci(dci);
+  nr_sniffer_dci_t d = *dci;
+  d.timestamp_us = nr_sniffer_now_us();
+  char row[512];
+  nr_sniffer_dci_row(row, sizeof(row), &d, "sniffer");
+  pthread_mutex_lock(&S.lock);
+  S.nb_dci++;
+  nr_sniffer_csv_row(&S.dci_csv, "%s", row);
   pthread_mutex_unlock(&S.lock);
 }

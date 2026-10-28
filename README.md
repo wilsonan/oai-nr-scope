@@ -19,7 +19,17 @@ random-access attempt.
 - [x] Run `scripts/rfsim_test.sh` until it prints `RESULT: PASS`
 - [x] Stretch: T-tracer ground-truth logger (`nr-gnb-dci-logger`, `scripts/gnb_dci_test.sh` passes)
 
-Milestone 2 (RACH/Msg4 tracking + DCI decoding for one UE) is in progress.
+Milestone 2 (RACH/Msg4 tracking + DCI decoding for one UE) is **done** in the RF simulator.
+`scripts/dci_test.sh` prints `RESULT: PASS`: the sniffer follows the UE through RAR and Msg4. It
+misses 0 of its DCIs (e.g. 0/575 in 20 s), with 0 false positives and identical fields. The gNB
+sees no transmission from the sniffer.
+
+- [x] RA-RNTIs from SIB1, RAR → TC-RNTI tracking (`nr_sniffer_ra.c`, `rar.csv`)
+- [x] Msg4/RRCSetup → follow the UE with OAI's own UE MAC/RRC (`ue.csv`)
+- [x] DCI 0_0/0_1/1_0/1_1 logging with PRBs, MCS, TBS, HARQ (`dci.csv`, same schema as the gNB logger)
+- [x] All UL dropped when passive; `scripts/compare_dci.py` checks miss rate, false positives, fields, passivity
+- [ ] DCI 0_1/1_1 exercised end to end. Without a core the gNB never leaves the common SS; see
+      [doc/DESIGN.md](doc/DESIGN.md#milestone-2-results-and-limits)
 
 ## Quick start
 
@@ -29,9 +39,10 @@ scripts/setup_oai.sh                    # clones OAI 2026.w41 into ./oai, applie
 scripts/build.sh                        # nr-sniffer, nr-softmodem, nr-uesoftmodem, rfsimulator
 scripts/rfsim_test.sh                   # gNB (rfsim) + sniffer, checks MIB/SIB1 against the gNB config
 scripts/gnb_dci_test.sh                 # gNB (rfsim, T-tracer) + nr-gnb-dci-logger + one UE
+scripts/dci_test.sh                     # + nr-sniffer following the UE; compares its DCIs with the gNB's
 ```
 
-Running the sniffer against a cell:
+Running the sniffer against a cell (start it before the UEs you want to follow attach):
 
 ```bash
 cd oai/cmake_targets/ran_build/build

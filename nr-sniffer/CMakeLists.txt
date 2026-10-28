@@ -17,6 +17,7 @@ add_executable(nr-sniffer
   ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_csv.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_dci.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_ra.c
 )
 
 target_include_directories(nr-sniffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -18,8 +18,11 @@ T_DB="$OAI_DIR/common/utils/T/T_messages.txt"
 OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
 mkdir -p "$OUT_DIR" && OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
-# A gNB left over from an earlier run keeps the rfsim and T-tracer ports busy.
-if pgrep -x nr-softmodem > /dev/null || pgrep -x nr-uesoftmodem > /dev/null || pgrep -x nr-sniffer > /dev/null; then
+# A gNB left over from an earlier run keeps the rfsim and T-tracer ports busy. nr-softmodem's forked
+# helper process outlives it by a few seconds, so give a just-finished test time to wind down.
+others_running() { pgrep -x nr-softmodem > /dev/null || pgrep -x nr-uesoftmodem > /dev/null || pgrep -x nr-sniffer > /dev/null; }
+for _ in $(seq 1 15); do others_running || break; sleep 1; done
+if others_running; then
   echo "FAIL: nr-softmodem, nr-uesoftmodem or nr-sniffer is already running; stop it first"
   echo "RESULT: FAIL"
   exit 1

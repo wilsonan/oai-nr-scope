@@ -8,25 +8,13 @@
 
 #include <stdint.h>
 
+#include "common/utils/nr_sniffer_hooks.h"
+
 #define NR_SNIFFER_DCI_HEADER                                                                                      \
   "timestamp_us,sfn,slot,rnti,rnti_type,dci_format,direction,bwp_id,coreset_id,ss_id,aggregation_level,cce_index," \
   "prb_start,prb_len,mcs,mcs_table,tbs_bits,ndi,rv,harq_id,source"
 
-/// One DCI, with the PDSCH/PUSCH allocation it schedules. prb_start is relative to the BWP start.
-typedef struct {
-  uint64_t timestamp_us;
-  int sfn, slot; ///< frame and slot the PDCCH was sent in
-  int rnti;
-  int rnti_type; ///< nr_rnti_type_t
-  int dci_format; ///< nr_dci_format_t
-  int bwp_id, coreset_id, ss_id;
-  int aggregation_level, cce_index;
-  int prb_start, prb_len;
-  int mcs;
-  int mcs_table; ///< FAPI mcsTable / mcs_table index
-  int tbs_bits;
-  int ndi, rv, harq_id;
-} nr_sniffer_dci_t;
+/* nr_sniffer_dci_t (one DCI with the allocation it schedules) is defined in OAI's nr_sniffer_hooks.h */
 
 const char *nr_sniffer_rnti_type_name(int rnti_type);
 const char *nr_sniffer_dci_format_name(int dci_format);
