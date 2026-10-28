@@ -40,6 +40,7 @@ static struct {
   int follow_ue;
   char *cellgroup_file;
   int rnti;
+  int max_ues;
   /* outputs */
   nr_sniffer_csv_t mib_csv;
   nr_sniffer_csv_t sib1_csv;
@@ -108,6 +109,7 @@ void nr_sniffer_init(configmodule_interface_t *cfg)
       STRINGPARAM("cellgroup_file", "follow a UE with this known UPER CellGroupConfig or RRCReconfiguration", 0,
                   &S.cellgroup_file, ""),
       INTPARAM("rnti", "C-RNTI of the UE in cellgroup_file (-1: from its reconfigurationWithSync)", 0, &S.rnti, -1),
+      INTPARAM("max_ues", "follow at most this many UEs at once (1..14)", 0, &S.max_ues, 8),
   };
   config_get(cfg, params, sizeof(params) / sizeof(params[0]), SNIFFER_SECTION);
 
@@ -116,7 +118,7 @@ void nr_sniffer_init(configmodule_interface_t *cfg)
   nr_sniffer_csv_open(&S.mib_csv, S.out_dir, "mib.csv", MIB_HEADER);
   nr_sniffer_csv_open(&S.sib1_csv, S.out_dir, "sib1.csv", SIB1_HEADER);
   nr_sniffer_csv_open(&S.dci_csv, S.out_dir, "dci.csv", NR_SNIFFER_DCI_HEADER);
-  nr_sniffer_ra_init(S.out_dir, S.passive && S.follow_ue);
+  nr_sniffer_ra_init(S.out_dir, S.passive && S.follow_ue, S.max_ues);
   if (S.cellgroup_file && S.cellgroup_file[0] && !nr_sniffer_ra_load_known_ue(S.cellgroup_file, S.rnti))
     exit(1);
 

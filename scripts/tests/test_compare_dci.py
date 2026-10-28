@@ -191,6 +191,76 @@ class CompareDci(unittest.TestCase):
         self.assertIn("false positives: 0 ", out)
 
 
+RNTI2 = 0x7A01
+
+
+def two_ue_run_inputs():
+    """two UEs attach 2 s apart on the same RA-RNTI; their DCIs interleave, and the first stays until the end"""
+    g1 = ue_dcis(0, 900)
+    g2 = [dict(r, rnti=f"0x{RNTI2:04x}") if r["rnti"] == f"0x{RNTI:04x}" else r for r in ue_dcis(4000, 400)]
+    for r in g2:  # offset by one slot so the two UEs' DCIs never share a slot
+        n = (r["timestamp_us"] - T0) // SLOT_US + 1
+        r.update(timestamp_us=T0 + n * SLOT_US, sfn=(n // 20) % 1024, slot=n % 20)
+    g = sorted(g1 + g2, key=lambda r: r["timestamp_us"])
+    log = GNB_LOG + (f"[NR_PHY] [RAPROC] 406.10 Initiating RA procedure with preamble 12\n"
+                     f"[NR_MAC] 406.10 UE RA-RNTI {RA_RNTI:04x} TC-RNTI {RNTI2:04x}: initiating RA procedure\n"
+                     "[NR_RRC] Create UE context: CU UE ID 2\n")
+    rar = [dict(timestamp_us=T0, sfn=10, slot=10, rapid=35, timing_advance=0, ul_grant="0x0000000",
+                tc_rnti=f"0x{RNTI:04x}"),
+           dict(timestamp_us=T0 + 2_000_000, sfn=210, slot=10, rapid=12, timing_advance=0, ul_grant="0x0000000",
+                tc_rnti=f"0x{RNTI2:04x}")]
+    ue = [dict(timestamp_us=T0, sfn=11, slot=10, c_rnti=f"0x{RNTI:04x}", contention_resolution_id="0x01"),
+          dict(timestamp_us=T0 + 2_000_000, sfn=211, slot=10, c_rnti=f"0x{RNTI2:04x}", contention_resolution_id="0x02")]
+    return g, log, rar, ue
+
+
+class CompareDciMultiUe(unittest.TestCase):
+    def new(self, g, s, log, rar, ue):
+        run = Run(g, s, ue_rows=ue, gnb_log=log, ue_log=UE_LOG + UE_LOG)
+        Run.write_csv(f"{run.dir}/sniffer/rar.csv", ["timestamp_us", "sfn", "slot", "rapid", "timing_advance",
+                                                     "ul_grant", "tc_rnti"], rar)
+        self.addCleanup(run.tmp.cleanup)
+        return run
+
+    def test_two_ues_followed_pass(self):
+        g, log, rar, ue = two_ue_run_inputs()
+        run = self.new(g, shifted(g, 3000), log, rar, ue)
+        rc, out = run.compare()
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"INFO UE 0x{RNTI:04x}: 0/", out)
+        self.assertIn(f"INFO UE 0x{RNTI2:04x}: 0/", out)
+        self.assertIn("2 UEs", run.line(out, "DCI miss rate"))
+        # the second UE's RAR DCI on the shared RA-RNTI is not a false positive of the first
+        self.assertIn("false positives: 0 ", out)
+
+    def test_second_ue_not_followed_fails(self):
+        g, log, rar, ue = two_ue_run_inputs()
+        s = [r for r in shifted(g, 3000) if r["rnti"] != f"0x{RNTI2:04x}"]
+        rc, out = self.new(g, s, log, rar, ue[:1]).compare()
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL Msg4", out)
+        self.assertIn(f"not followed: 0x{RNTI2:04x}", out)
+        self.assertIn("FAIL DCI miss rate", out)
+
+    def test_misses_add_up_over_ues(self):
+        g, log, rar, ue = two_ue_run_inputs()
+        s = shifted(g, 3000)
+        mine = [i for i, r in enumerate(s) if r["rnti"] == f"0x{RNTI2:04x}"]
+        for i in sorted(mine[100:106], reverse=True):
+            del s[i]
+        rc, out = self.new(g, s, log, rar, ue).compare()
+        self.assertIn(f"INFO UE 0x{RNTI2:04x}: 6/", out)
+        self.assertIn("6/", out.split("DCI miss rate:")[1])
+
+    def test_stray_c_rnti_dci_is_a_false_positive(self):
+        g, log, rar, ue = two_ue_run_inputs()
+        s = shifted(g, 3000) + [dci(5000, rnti=0x4444, source="sniffer")]
+        s.sort(key=lambda r: r["timestamp_us"])
+        rc, out = self.new(g, s, log, rar, ue).compare()
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL false positives: 1 ", out)
+
+
 class CheckGnbDci(unittest.TestCase):
     def run_check(self, rows, log):
         with tempfile.TemporaryDirectory() as d:

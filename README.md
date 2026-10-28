@@ -38,7 +38,10 @@ Milestone 3 is **in progress**:
       RRCReconfiguration that carries it is ciphered
 - [x] `scripts/phytest_dci_test.sh`: phy-test, DCI 1_1/0_1, 0 of 28 648 missed
 - [x] `scripts/known_ue_test.sh`: SA, sniffer started after the UE attached, 0 of 421 missed
-- [ ] Several UEs at once (multi-RNTI refactor), worker pool, multi-UE evaluation report
+- [x] Several UEs at once: one shadow MAC instance per followed UE, `--sniffer.max_ues` (default 8, max 14).
+      `scripts/multi_ue_test.sh`: 3 UEs, 0 of 3 868 DCIs missed; 6 UEs, 0 of 9 748 missed
+- [x] Multi-UE evaluation: `compare_dci.py` checks every UE that attached, per UE and in total
+- [ ] One PDCCH demodulation per CORESET for all UEs (today the cost grows per followed UE), worker pool
 
 ## Quick start
 
@@ -52,6 +55,7 @@ scripts/gnb_dci_test.sh                 # gNB (rfsim, T-tracer) + nr-gnb-dci-log
 scripts/dci_test.sh                     # + nr-sniffer following the UE; compares its DCIs with the gNB's
 scripts/phytest_dci_test.sh             # phy-test gNB/UE/sniffer, DCI 0_1/1_1 with a known configuration
 scripts/known_ue_test.sh                # SA, sniffer joins late with the UE's CellGroupConfig from the gNB
+NUM_UES=3 scripts/multi_ue_test.sh      # several UEs attaching one after the other, all followed
 ```
 
 ## Tests
@@ -62,14 +66,17 @@ scripts/known_ue_test.sh                # SA, sniffer joins late with the UE's C
   - the RA-RNTI set from a real SIB1;
   - RAR parsing, including a truncated PDU;
   - tracked-RNTI matching (CRC remainder, PDCCH configuration);
-  - Msg4 adoption, one UE only, and that a Msg3 grant is not mistaken for a Msg4;
+  - Msg4 parsing (contention resolution CE, CCCH RRCSetup → CellGroupConfig), one shadow MAC
+    instance per followed UE, the `max_ues` cap, Msg4s that must not be followed, and that a Msg3
+    grant is not mistaken for a Msg4;
   - known-configuration loading (CellGroupConfig, phy-test RRCReconfiguration, wrong files);
   - the DCI CSV row.
 
   The fixtures in `nr-sniffer/tests/data/` come from rfsim runs.
 - `scripts/tests/` (Python) runs `compare_dci.py` and `check_gnb_dci.py` on synthetic logs. It
   covers misses, false positives, field mismatches, a sniffer PRACH, matching across the SFN wrap,
-  and the start of the window for known-configuration and phy-test runs.
+  the start of the window for known-configuration and phy-test runs, and several UEs: a UE that
+  was not followed, misses added up over UEs, and RARs shared between UEs.
 
 The rfsim end-to-end tests are listed under Quick start.
 

@@ -1,8 +1,10 @@
 /*
- * nr-sniffer: following other UEs through random access (milestone 2).
+ * nr-sniffer: following other UEs through random access, or with a known configuration.
  *
- * Strong definitions of the RA hooks in common/utils/nr_sniffer_hooks.h. Only one UE is followed
- * (the first whose Msg4 is decoded); multi-UE tracking is milestone 3.
+ * Strong definitions of the RA and UE-following hooks in common/utils/nr_sniffer_hooks.h.
+ * RA-RNTI (from the SIB1 PRACH configuration) -> RAR -> TC-RNTI -> Msg4 -> C-RNTI. Each followed UE
+ * gets its own shadow MAC instance in OAI's UE MAC (instance 1, 2, ...), configured with the cell
+ * configuration plus that UE's CellGroupConfig, so that OAI's own DCI decoding follows it.
  */
 
 #include "nr_sniffer_ra.h"
@@ -15,52 +17,81 @@
 #include "openair2/LAYER2/NR_MAC_COMMON/nr_mac_common.h"
 #include "openair2/LAYER2/NR_MAC_COMMON/nr_prach_config.h"
 #include "NR_CellGroupConfig.h"
+#include "NR_DL-CCCH-Message.h"
 #include "NR_RRCReconfiguration.h"
+#include "NR_RRCSetup.h"
+#include "NR_RRCSetup-IEs.h"
 #include "NR_SIB1.h"
 #include "NR_ServingCellConfigCommonSIB.h"
 #include "nr_sniffer_csv.h"
 
 #define MAX_RA_RNTI 128
 #define MAX_TC_RNTI 16
+#define MAX_KNOWN_UE 4
 /// a TC-RNTI from a RAR is dropped if no Msg4 comes within this time (ra-ContentionResolutionTimer is at most 64 ms)
 #define TC_RNTI_LIFETIME_US 1000000
+
+/* DL-SCH LCIDs (TS 38.321 Table 6.2.1-1) */
+#define LCID_CCCH 0
+#define LCID_MAX_SDU 32
+#define LCID_DRX_LONG 59
+#define LCID_DRX 60
+#define LCID_TA_COMMAND 61
+#define LCID_CON_RES_ID 62
+#define LCID_PADDING 63
 
 typedef struct {
   uint16_t rnti;
   uint64_t seen_us;
 } tc_rnti_t;
 
+typedef struct {
+  uint16_t rnti;
+  int instance; ///< shadow MAC instance in OAI's UE MAC
+} followed_ue_t;
+
+typedef struct {
+  NR_CellGroupConfig_t *cg;
+  uint16_t rnti;
+} known_ue_t;
+
 static struct {
   pthread_mutex_t lock;
   bool follow;
+  int max_ues;
   int nb_ra;
   uint16_t ra[MAX_RA_RNTI];
   int nb_tc;
   tc_rnti_t tc[MAX_TC_RNTI];
-  uint16_t adopted; ///< C-RNTI of the UE being followed, 0 until its Msg4 is decoded
-  uint16_t last_tc_dl; ///< TC-RNTI of the last DL DCI on a TC-RNTI (the Msg4 the next contention resolution belongs to)
+  int nb_ues;
+  followed_ue_t ues[NR_SNIFFER_MAX_UES];
+  int nb_known;
+  known_ue_t known[MAX_KNOWN_UE]; ///< known configurations waiting for SIB1
+  uint16_t last_tc_dl; ///< TC-RNTI of the last DL DCI 1_0 on a TC-RNTI (the Msg4 the next PDU belongs to)
+  NR_SIB1_t *sib1; ///< copy of the last SIB1, to configure shadow MAC instances
   nr_sniffer_csv_t rar_csv;
   nr_sniffer_csv_t ue_csv;
-  NR_CellGroupConfig_t *known_cg; ///< configuration of a UE to follow from the start (handed to the MAC once)
-  uint16_t known_rnti;
-} R = {.lock = PTHREAD_MUTEX_INITIALIZER};
+} R = {.lock = PTHREAD_MUTEX_INITIALIZER, .max_ues = NR_SNIFFER_MAX_UES};
 
 void nr_sniffer_ra_reset(void)
 {
   pthread_mutex_lock(&R.lock);
-  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, R.known_cg);
-  R.known_cg = NULL;
-  R.known_rnti = 0;
+  for (int i = 0; i < R.nb_known; i++)
+    ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, R.known[i].cg);
+  R.nb_known = 0;
   R.nb_ra = 0;
   R.nb_tc = 0;
-  R.adopted = 0;
+  R.nb_ues = 0;
   R.last_tc_dl = 0;
+  ASN_STRUCT_FREE(asn_DEF_NR_SIB1, R.sib1);
+  R.sib1 = NULL;
   pthread_mutex_unlock(&R.lock);
 }
 
-void nr_sniffer_ra_init(const char *out_dir, bool follow)
+void nr_sniffer_ra_init(const char *out_dir, bool follow, int max_ues)
 {
   R.follow = follow;
+  R.max_ues = max_ues < 0 ? 0 : max_ues > NR_SNIFFER_MAX_UES ? NR_SNIFFER_MAX_UES : max_ues;
   nr_sniffer_csv_open(&R.rar_csv, out_dir, "rar.csv", "timestamp_us,sfn,slot,rapid,timing_advance,ul_grant,tc_rnti");
   nr_sniffer_csv_open(&R.ue_csv, out_dir, "ue.csv", "timestamp_us,sfn,slot,c_rnti,contention_resolution_id");
 }
@@ -86,12 +117,37 @@ static void remove_tc(int i)
   R.tc[i] = R.tc[--R.nb_tc];
 }
 
+static int find_ue(uint16_t rnti)
+{
+  for (int i = 0; i < R.nb_ues; i++)
+    if (R.ues[i].rnti == rnti)
+      return i;
+  return -1;
+}
+
+/* Follow \p rnti in the next shadow MAC instance; -1 if the table is full or it is already followed.
+ * Instances are never reused, so one instance always means one UE in the logs. */
+static int add_ue(uint16_t rnti)
+{
+  if (R.nb_ues >= R.max_ues || find_ue(rnti) >= 0)
+    return -1;
+  const int instance = R.nb_ues + 1;
+  R.ues[R.nb_ues++] = (followed_ue_t){.rnti = rnti, .instance = instance};
+  return instance;
+}
+
 /* RA-RNTI = 1 + s_id + 14 t_id + 14 * 80 * f_id (TS 38.321 5.1.3) for every PRACH occasion of the
  * configuration, following configure_prach_occasions() of the OAI UE (but without the TDD UL-slot
  * filter: an RA-RNTI of an occasion that cannot be used simply never shows up). */
 void nr_sniffer_ra_configure(const void *sib1_ptr, bool fr2)
 {
   const NR_SIB1_t *sib1 = sib1_ptr;
+  pthread_mutex_lock(&R.lock);
+  ASN_STRUCT_FREE(asn_DEF_NR_SIB1, R.sib1);
+  R.sib1 = NULL;
+  asn_copy(&asn_DEF_NR_SIB1, (void **)&R.sib1, sib1);
+  pthread_mutex_unlock(&R.lock);
+
   const NR_ServingCellConfigCommonSIB_t *scc = sib1->servingCellConfigCommon;
   if (!R.follow || !scc || !scc->uplinkConfigCommon)
     return;
@@ -130,9 +186,15 @@ void nr_sniffer_ra_configure(const void *sib1_ptr, bool fr2)
   printf("[SNIFFER] Watching random access: PRACH config %d, %d RA-RNTIs:", config_index, R.nb_ra);
   for (int i = 0; i < R.nb_ra; i++)
     printf(" %04x", R.ra[i]);
-  printf("\n");
+  printf(" (following up to %d UEs)\n", R.max_ues);
   fflush(stdout);
   pthread_mutex_unlock(&R.lock);
+}
+
+const void *nr_sniffer_sib1(void)
+{
+  /* written once per SIB1 change, read by the MAC when it creates a shadow instance */
+  return R.sib1;
 }
 
 uint16_t nr_sniffer_ra_watch_rnti(void)
@@ -192,7 +254,7 @@ void nr_sniffer_on_rar(const uint8_t *pdu, int len, int frame, int slot)
       const uint16_t tc_rnti = (rar[5] << 8) | rar[6];
       nr_sniffer_csv_row(&R.rar_csv, "%lu,%d,%d,%d,%d,0x%07x,0x%04x", now, frame, slot, rapid, ta, ul_grant, tc_rnti);
       printf("[SNIFFER] RAR at %d.%d: RAPID %d, TA %d, TC-RNTI %04x\n", frame, slot, rapid, ta, tc_rnti);
-      if (!R.adopted && find_tc(tc_rnti) < 0) {
+      if (find_tc(tc_rnti) < 0 && find_ue(tc_rnti) < 0) {
         if (R.nb_tc == MAX_TC_RNTI)
           remove_tc(0);
         R.tc[R.nb_tc++] = (tc_rnti_t){.rnti = tc_rnti, .seen_us = now};
@@ -206,22 +268,113 @@ void nr_sniffer_on_rar(const uint8_t *pdu, int len, int frame, int slot)
   pthread_mutex_unlock(&R.lock);
 }
 
-uint16_t nr_sniffer_on_contention_resolution(const uint8_t *cont_res_id, int frame, int slot)
+static NR_CellGroupConfig_t *decode_cellgroup(const uint8_t *buf, int len)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  asn_dec_rval_t r = uper_decode_complete(NULL, &asn_DEF_NR_CellGroupConfig, (void **)&cg, buf, len);
+  if (r.code == RC_OK && r.consumed == len)
+    return cg;
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return NULL;
+}
+
+/* the masterCellGroup of an RRCSetup in a DL-CCCH SDU, or NULL */
+static NR_CellGroupConfig_t *cellgroup_from_rrcsetup(const uint8_t *buf, int len)
+{
+  NR_DL_CCCH_Message_t *msg = NULL;
+  NR_CellGroupConfig_t *cg = NULL;
+  asn_dec_rval_t r = uper_decode(NULL, &asn_DEF_NR_DL_CCCH_Message, (void **)&msg, buf, len, 0, 0);
+  if (r.code == RC_OK && msg->message.present == NR_DL_CCCH_MessageType_PR_c1
+      && msg->message.choice.c1->present == NR_DL_CCCH_MessageType__c1_PR_rrcSetup) {
+    const NR_RRCSetup_t *setup = msg->message.choice.c1->choice.rrcSetup;
+    if (setup->criticalExtensions.present == NR_RRCSetup__criticalExtensions_PR_rrcSetup) {
+      const OCTET_STRING_t *mcg = &setup->criticalExtensions.choice.rrcSetup->masterCellGroup;
+      cg = decode_cellgroup(mcg->buf, mcg->size);
+    }
+  }
+  ASN_STRUCT_FREE(asn_DEF_NR_DL_CCCH_Message, msg);
+  return cg;
+}
+
+bool nr_sniffer_on_msg4(const uint8_t *pdu, int len, int frame, int slot, uint16_t *rnti, void **cell_group, int *instance)
+{
+  /* TS 38.321 6.1.2: R/F/LCID[/L] subheaders; fixed-size MAC CEs and padding have no L field */
+  const uint8_t *cont_res = NULL, *ccch = NULL;
+  int ccch_len = 0;
+  int pos = 0;
+  while (pos < len) {
+    const int lcid = pdu[pos] & 0x3f;
+    if (lcid <= LCID_MAX_SDU) {
+      const bool f = pdu[pos] & 0x40;
+      if (pos + (f ? 3 : 2) > len)
+        break;
+      const int l = f ? (pdu[pos + 1] << 8) | pdu[pos + 2] : pdu[pos + 1];
+      pos += f ? 3 : 2;
+      if (pos + l > len)
+        break;
+      if (lcid == LCID_CCCH) {
+        ccch = &pdu[pos];
+        ccch_len = l;
+      }
+      pos += l;
+    } else if (lcid == LCID_CON_RES_ID) {
+      if (pos + 7 > len)
+        break;
+      cont_res = &pdu[pos + 1];
+      pos += 7;
+    } else if (lcid == LCID_TA_COMMAND) {
+      pos += 2;
+    } else if (lcid == LCID_DRX || lcid == LCID_DRX_LONG) {
+      pos += 1;
+    } else { /* padding, or a MAC CE a Msg4 does not carry */
+      break;
+    }
+  }
+  if (!cont_res)
+    return false; /* not a Msg4 */
+
+  pthread_mutex_lock(&R.lock);
+  const uint16_t tc = R.last_tc_dl;
+  const int i = find_tc(tc);
+  NR_CellGroupConfig_t *cg = NULL;
+  int inst = -1;
+  if (R.follow && i >= 0 && ccch && R.nb_ues < R.max_ues && (cg = cellgroup_from_rrcsetup(ccch, ccch_len))) {
+    inst = add_ue(tc);
+    remove_tc(i); /* from now on its shadow MAC instance owns this RNTI */
+    nr_sniffer_csv_row(&R.ue_csv, "%lu,%d,%d,0x%04x,0x%02x%02x%02x%02x%02x%02x", nr_sniffer_now_us(), frame, slot, tc,
+                       cont_res[0], cont_res[1], cont_res[2], cont_res[3], cont_res[4], cont_res[5]);
+    printf("[SNIFFER] Msg4 at %d.%d: following UE with C-RNTI %04x (shadow MAC %d, %d UEs followed)\n", frame, slot, tc,
+           inst, R.nb_ues);
+    *rnti = tc;
+    *cell_group = cg;
+    *instance = inst;
+  } else {
+    printf("[SNIFFER] Msg4 at %d.%d on TC-RNTI %04x not followed (%s)\n", frame, slot, tc,
+           i < 0 ? "TC-RNTI not from a decoded RAR" : !ccch ? "no RRCSetup" : R.nb_ues >= R.max_ues ? "max_ues reached"
+                                                                                                    : "RRCSetup not decoded");
+  }
+  fflush(stdout);
+  pthread_mutex_unlock(&R.lock);
+  return true;
+}
+
+int nr_sniffer_shadow_instance(uint16_t rnti)
 {
   pthread_mutex_lock(&R.lock);
-  uint16_t adopted = 0;
-  const int i = find_tc(R.last_tc_dl);
-  if (R.follow && !R.adopted && i >= 0) {
-    adopted = R.adopted = R.last_tc_dl;
-    remove_tc(i); /* from now on it is this MAC's C-RNTI */
-    nr_sniffer_csv_row(&R.ue_csv, "%lu,%d,%d,0x%04x,0x%02x%02x%02x%02x%02x%02x", nr_sniffer_now_us(), frame, slot,
-                       adopted, cont_res_id[0], cont_res_id[1], cont_res_id[2], cont_res_id[3], cont_res_id[4],
-                       cont_res_id[5]);
-    printf("[SNIFFER] Msg4 at %d.%d: following UE with C-RNTI %04x\n", frame, slot, adopted);
-    fflush(stdout);
-  }
+  const int i = find_ue(rnti);
+  const int instance = i >= 0 ? R.ues[i].instance : -1;
   pthread_mutex_unlock(&R.lock);
-  return adopted;
+  return instance;
+}
+
+int nr_sniffer_shadow_instances(int *instances, int max)
+{
+  pthread_mutex_lock(&R.lock);
+  int n = 0;
+  for (; n < R.nb_ues && n < max; n++)
+    instances[n] = R.ues[n].instance;
+  pthread_mutex_unlock(&R.lock);
+  return n;
 }
 
 void nr_sniffer_ra_on_dci(const nr_sniffer_dci_t *dci)
@@ -236,16 +389,6 @@ void nr_sniffer_ra_on_dci(const nr_sniffer_dci_t *dci)
 /* ------------------------------------------------------------------------- */
 /* known configuration (NR-Scope fixed_rnti)                                 */
 /* ------------------------------------------------------------------------- */
-
-static NR_CellGroupConfig_t *decode_cellgroup(const uint8_t *buf, int len)
-{
-  NR_CellGroupConfig_t *cg = NULL;
-  asn_dec_rval_t r = uper_decode_complete(NULL, &asn_DEF_NR_CellGroupConfig, (void **)&cg, buf, len);
-  if (r.code == RC_OK && r.consumed == len)
-    return cg;
-  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
-  return NULL;
-}
 
 /* the CellGroupConfig carried by an RRCReconfiguration: masterCellGroup (SA) or secondaryCellGroup (NSA, phy-test) */
 static NR_CellGroupConfig_t *cellgroup_from_reconfiguration(const uint8_t *buf, int len)
@@ -299,24 +442,37 @@ bool nr_sniffer_ra_load_known_ue(const char *path, int rnti)
     return false;
   }
   pthread_mutex_lock(&R.lock);
-  R.known_cg = cg;
-  R.known_rnti = rnti;
-  R.adopted = rnti; /* do not adopt another UE through random access */
+  const bool room = R.nb_known < MAX_KNOWN_UE;
+  if (room)
+    R.known[R.nb_known++] = (known_ue_t){.cg = cg, .rnti = rnti};
   pthread_mutex_unlock(&R.lock);
+  if (!room) {
+    fprintf(stderr, "[SNIFFER] at most %d known configurations\n", MAX_KNOWN_UE);
+    ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+    return false;
+  }
   printf("[SNIFFER] Known configuration: %s from %s (%d bytes) for C-RNTI %04x\n", kind, path, len, rnti);
   fflush(stdout);
   return true;
 }
 
-void *nr_sniffer_known_ue(uint16_t *rnti)
+void *nr_sniffer_known_ue(uint16_t *rnti, int *instance)
 {
   pthread_mutex_lock(&R.lock);
-  NR_CellGroupConfig_t *cg = R.known_cg;
-  R.known_cg = NULL;
-  *rnti = R.known_rnti;
-  if (cg) {
-    nr_sniffer_csv_row(&R.ue_csv, "%lu,-1,-1,0x%04x,known", nr_sniffer_now_us(), R.known_rnti);
-    printf("[SNIFFER] SIB1 applied: following UE with C-RNTI %04x (known configuration)\n", R.known_rnti);
+  NR_CellGroupConfig_t *cg = NULL;
+  while (!cg && R.nb_known > 0) {
+    const known_ue_t k = R.known[--R.nb_known];
+    const int inst = add_ue(k.rnti);
+    if (inst < 0) {
+      fprintf(stderr, "[SNIFFER] not following C-RNTI %04x: max_ues reached or already followed\n", k.rnti);
+      ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, k.cg);
+      continue;
+    }
+    cg = k.cg;
+    *rnti = k.rnti;
+    *instance = inst;
+    nr_sniffer_csv_row(&R.ue_csv, "%lu,-1,-1,0x%04x,known", nr_sniffer_now_us(), k.rnti);
+    printf("[SNIFFER] SIB1 applied: following UE with C-RNTI %04x (known configuration, shadow MAC %d)\n", k.rnti, inst);
     fflush(stdout);
   }
   pthread_mutex_unlock(&R.lock);

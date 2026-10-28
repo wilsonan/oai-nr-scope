@@ -32,10 +32,10 @@ index 954017a..23c7849 100644
  ID = ENB_RLC_DL
 diff --git a/common/utils/nr_sniffer_hooks.h b/common/utils/nr_sniffer_hooks.h
 new file mode 100644
-index 0000000..5cda41b
+index 0000000..46e0ae0
 --- /dev/null
 +++ b/common/utils/nr_sniffer_hooks.h
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,178 @@
 +/*
 + * SPDX-License-Identifier: LicenseRef-CSSL-1.0
 + */
@@ -61,6 +61,9 @@ index 0000000..5cda41b
 +#endif
 +
 +typedef struct configmodule_interface configmodule_interface_t;
++
++/// most shadow MAC instances (followed UEs) the UE MAC asks the sniffer for
++#define NR_SNIFFER_MAX_SHADOWS 16
 +
 +/// MIB content as decoded by the UE MAC, plus PHY-level cell information.
 +typedef struct {
@@ -111,12 +114,21 @@ index 0000000..5cda41b
 +uint16_t nr_sniffer_ra_watch_rnti(void) __attribute__((weak));
 +/// UE MAC: a RAR MAC PDU was decoded on a tracked RA-RNTI.
 +void nr_sniffer_on_rar(const uint8_t *pdu, int len, int frame, int slot) __attribute__((weak));
-+/// UE MAC: a UE Contention Resolution Identity MAC CE (Msg4) was decoded. Returns the TC-RNTI it was sent
-+/// on if the sniffer adopts that UE (its C-RNTI and configuration become this MAC's), or 0.
-+uint16_t nr_sniffer_on_contention_resolution(const uint8_t *cont_res_id, int frame, int slot) __attribute__((weak));
++/// UE MAC: a DL-SCH MAC PDU decoded by the sniffer's own MAC. Returns true if it is another UE's Msg4 (it holds a
++/// UE Contention Resolution Identity CE): the PDU is the sniffer's, and its RRCSetup must not reach this UE's RRC.
++/// If the sniffer follows that UE, \p rnti, \p cell_group (an NR_CellGroupConfig_t *, from the RRCSetup; the
++/// caller applies and frees it) and \p instance (the shadow MAC instance for that UE) are set.
++bool nr_sniffer_on_msg4(const uint8_t *pdu, int len, int frame, int slot, uint16_t *rnti, void **cell_group, int *instance)
++    __attribute__((weak));
 +/// UE MAC, once SIB1 is applied: a UE to follow with a known configuration. Returns a NR_CellGroupConfig_t *
-+/// (the caller applies and frees it) and sets \p rnti, once; NULL otherwise.
-+void *nr_sniffer_known_ue(uint16_t *rnti) __attribute__((weak));
++/// (the caller applies and frees it) and sets \p rnti and \p instance (its shadow MAC instance), once; else NULL.
++void *nr_sniffer_known_ue(uint16_t *rnti, int *instance) __attribute__((weak));
++/// UE MAC: shadow MAC instance following \p rnti, or -1.
++int nr_sniffer_shadow_instance(uint16_t rnti) __attribute__((weak));
++/// UE MAC: the shadow MAC instances of all followed UEs (at most \p max). Returns their number.
++int nr_sniffer_shadow_instances(int *instances, int max) __attribute__((weak));
++/// UE SIB1 as last decoded (a const NR_SIB1_t *), to configure shadow MAC instances; NULL before SIB1.
++const void *nr_sniffer_sib1(void) __attribute__((weak));
 +
 +static inline void nr_sniffer_hook_init(configmodule_interface_t *cfg)
 +{
@@ -172,14 +184,29 @@ index 0000000..5cda41b
 +  return true;
 +}
 +
-+static inline void *nr_sniffer_hook_known_ue(uint16_t *rnti)
++static inline void *nr_sniffer_hook_known_ue(uint16_t *rnti, int *instance)
 +{
-+  return nr_sniffer_known_ue ? nr_sniffer_known_ue(rnti) : NULL;
++  return nr_sniffer_known_ue ? nr_sniffer_known_ue(rnti, instance) : NULL;
 +}
 +
-+static inline uint16_t nr_sniffer_hook_contention_resolution(const uint8_t *cont_res_id, int frame, int slot)
++static inline bool nr_sniffer_hook_msg4(const uint8_t *pdu, int len, int frame, int slot, uint16_t *rnti, void **cg, int *instance)
 +{
-+  return nr_sniffer_on_contention_resolution ? nr_sniffer_on_contention_resolution(cont_res_id, frame, slot) : 0;
++  return nr_sniffer_on_msg4 && nr_sniffer_passive() && nr_sniffer_on_msg4(pdu, len, frame, slot, rnti, cg, instance);
++}
++
++static inline int nr_sniffer_hook_shadow_instance(uint16_t rnti)
++{
++  return nr_sniffer_shadow_instance ? nr_sniffer_shadow_instance(rnti) : -1;
++}
++
++static inline int nr_sniffer_hook_shadow_instances(int *instances, int max)
++{
++  return nr_sniffer_shadow_instances ? nr_sniffer_shadow_instances(instances, max) : 0;
++}
++
++static inline const void *nr_sniffer_hook_get_sib1(void)
++{
++  return nr_sniffer_sib1 ? nr_sniffer_sib1() : NULL;
 +}
 +
 +#ifdef __cplusplus
@@ -207,6 +234,20 @@ index f9ebbc1..d18d412 100644
    CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
  
    softmodem_verify_mode(get_softmodem_params());
+diff --git a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_constants.h b/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_constants.h
+index e1e708e..d3e7aab 100644
+--- a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_constants.h
++++ b/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_constants.h
+@@ -46,7 +46,8 @@
+ 
+ /// DL_CONFIG_REQ
+ 
+-#define FAPI_NR_DL_CONFIG_LIST_NUM 10
++// nr-sniffer: 32 instead of 10, the sniffer adds about two search spaces per followed UE
++#define FAPI_NR_DL_CONFIG_LIST_NUM 32
+ 
+ #define FAPI_NR_DL_CONFIG_TYPE_DCI 0x01
+ #define FAPI_NR_DL_CONFIG_TYPE_DLSCH 0x02
 diff --git a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h b/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
 index ea3b90f..7060317 100644
 --- a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
@@ -289,10 +330,18 @@ index 1a8b22e..6e8c3da 100644
      switch (pdu->pdu_type) {
        case FAPI_NR_UL_CONFIG_TYPE_PUSCH: {
 diff --git a/openair2/LAYER2/NR_MAC_UE/config_ue.c b/openair2/LAYER2/NR_MAC_UE/config_ue.c
-index aad37a4..dfa5e6b 100644
+index aad37a4..d9e5efe 100644
 --- a/openair2/LAYER2/NR_MAC_UE/config_ue.c
 +++ b/openair2/LAYER2/NR_MAC_UE/config_ue.c
-@@ -2949,6 +2949,19 @@ static void handle_mac_uecap_info(NR_UE_MAC_INST_t *mac, NR_UE_NR_Capability_t *
+@@ -9,6 +9,7 @@
+ #define _GNU_SOURCE
+ 
+ #include "mac_defs.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include "NR_MAC_UE/mac_proto.h"
+ #include "NR_MAC-CellGroupConfig.h"
+ #include "LAYER2/NR_MAC_COMMON/nr_mac_common.h"
+@@ -2949,6 +2950,79 @@ static void handle_mac_uecap_info(NR_UE_MAC_INST_t *mac, NR_UE_NR_Capability_t *
    }
  }
  
@@ -309,19 +358,97 @@ index aad37a4..dfa5e6b 100644
 +  AssertFatal(!ret, "mutex failed %d\n", ret);
 +}
 +
++/* a shadow MAC instance has no PHY: its PHY configuration and synchronisation requests go nowhere */
++static void sniffer_noop_phy_config(nr_phy_config_t *phy_config)
++{
++  (void)phy_config;
++}
++
++static void sniffer_noop_synch(nr_synch_request_t *synch_request)
++{
++  (void)synch_request;
++}
++
++static nr_ue_if_module_t sniffer_shadow_if = {
++    .phy_config_request = sniffer_noop_phy_config,
++    .synch_request = sniffer_noop_synch,
++};
++
++void nr_ue_mac_follow_shadow(NR_UE_MAC_INST_t *main, int instance, uint16_t rnti, NR_CellGroupConfig_t *cell_group)
++{
++  const NR_SIB1_t *sniffer_sib1 = nr_sniffer_hook_get_sib1();
++  if (instance <= 0 || !main->mib || !sniffer_sib1) {
++    LOG_E(NR_MAC, "nr-sniffer: cannot follow C-RNTI %04x (instance %d, MIB %p, SIB1 %p)\n", rnti, instance, main->mib, sniffer_sib1);
++    return;
++  }
++  NR_UE_MAC_INST_t *mac = get_mac_inst(instance);
++  if (mac) {
++    LOG_E(NR_MAC, "nr-sniffer: MAC instance %d is already in use, not following C-RNTI %04x\n", instance, rnti);
++    return;
++  }
++  mac = nr_l2_init_ue(instance, main->numerology, main->rx2tx_capability);
++  mac->sniffer_shadow = true;
++  mac->if_module = &sniffer_shadow_if;
++  /* what the PHY reports with the MIB (handle_bcch_bch()) */
++  mac->physCellId = main->physCellId;
++  mac->mib_ssb = main->mib_ssb;
++  mac->mib_additional_bits = main->mib_additional_bits;
++  mac->ssb_start_subcarrier = main->ssb_start_subcarrier;
++  mac->frequency_range = main->frequency_range;
++  mac->dl_frequency = main->dl_frequency; /* from the command line (-C), as for the main instance */
++  nr_rrc_mac_config_req_mib(instance, 0, main->mib, false);
++  /* nr_rrc_mac_config_req_sib1() takes over parts of the SIB1 it is given, as from the RRC: give it its own copy */
++  NR_SIB1_t *sib1 = NULL;
++  asn_copy(&asn_DEF_NR_SIB1, (void **)&sib1, sniffer_sib1);
++  nr_rrc_mac_config_req_sib1(instance, 0, sib1, false);
++  SEQUENCE_free(&asn_DEF_NR_SIB1, sib1, ASFM_FREE_EVERYTHING);
++  nr_rrc_mac_config_req_cg(instance, 0, 0, 0, cell_group, NULL);
++  /* CORESET 0 and SearchSpace 0 come from the MIB; the main instance built them while acquiring SIB1 */
++  mac->update_pdcch_config = true;
++  nr_ue_mac_follow_rnti(instance, rnti);
++}
++
++void nr_ue_mac_flush_ul_config(NR_UE_MAC_INST_t *mac)
++{
++  for (int slot = 0; slot < mac->frame_structure.numb_slots_frame; slot++) {
++    fapi_nr_ul_config_request_t *ul_config = mac->ul_config_request + slot;
++    pthread_mutex_lock(&ul_config->mutex_ul_config);
++    ul_config->number_pdus = 0;
++    pthread_mutex_unlock(&ul_config->mutex_ul_config);
++  }
++}
++
  void nr_rrc_mac_config_req_cg(module_id_t module_id,
                                int cc_idP,
                                int hfn,
+diff --git a/openair2/LAYER2/NR_MAC_UE/mac_defs.h b/openair2/LAYER2/NR_MAC_UE/mac_defs.h
+index c399cc8..e2f1825 100644
+--- a/openair2/LAYER2/NR_MAC_UE/mac_defs.h
++++ b/openair2/LAYER2/NR_MAC_UE/mac_defs.h
+@@ -654,6 +654,8 @@ typedef struct NR_UE_MAC_INST_s {
+   // set when mac configuration changes during reconf with sync
+   // reset when pdcch config is changed after pbch read after reconf
+   bool update_pdcch_config;
++  /// nr-sniffer: this instance follows another UE's DCIs for the sniffer; it has no PHY or RRC
++  bool sniffer_shadow;
+ } NR_UE_MAC_INST_t;
+ 
+ static inline int GET_NTN_UE_K_OFFSET(const fapi_nr_ntn_config_t *ntn_ta, int scs)
 diff --git a/openair2/LAYER2/NR_MAC_UE/mac_proto.h b/openair2/LAYER2/NR_MAC_UE/mac_proto.h
-index dd2ab39..7466e1f 100644
+index dd2ab39..d80a990 100644
 --- a/openair2/LAYER2/NR_MAC_UE/mac_proto.h
 +++ b/openair2/LAYER2/NR_MAC_UE/mac_proto.h
-@@ -56,6 +56,9 @@ void release_dl_BWP(NR_UE_MAC_INST_t *mac, int index);
+@@ -56,6 +56,14 @@ void release_dl_BWP(NR_UE_MAC_INST_t *mac, int index);
  void release_ul_BWP(NR_UE_MAC_INST_t *mac, int index);
  void nr_release_mac_config_logicalChannelBearer(NR_UE_MAC_INST_t *mac, long channel_identity);
  
 +/// nr-sniffer: take \p rnti as this MAC's C-RNTI and consider the UE connected (its CellGroupConfig is applied)
 +void nr_ue_mac_follow_rnti(module_id_t module_id, uint16_t rnti);
++/// nr-sniffer: create shadow MAC instance \p instance for another UE: the cell configuration of \p main (MIB, SIB1)
++/// plus that UE's \p cell_group, and C-RNTI \p rnti. The shadow has no PHY or RRC; it only parses that UE's DCIs.
++void nr_ue_mac_follow_shadow(NR_UE_MAC_INST_t *main, int instance, uint16_t rnti, NR_CellGroupConfig_t *cell_group);
++/// nr-sniffer: drop every UL configuration a shadow MAC instance prepared (it never transmits)
++void nr_ue_mac_flush_ul_config(NR_UE_MAC_INST_t *mac);
 +
  void nr_rrc_mac_config_req_cg(module_id_t module_id,
                                int cc_idP,
@@ -348,7 +475,7 @@ index b725793..a854191 100644
    mac->state = UE_PERFORMING_RA;
    reset_ra(mac, false);
 diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
-index ad89949..66dd5ec 100644
+index ad89949..46d2af7 100644
 --- a/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
 +++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
 @@ -13,6 +13,7 @@
@@ -375,7 +502,7 @@ index ad89949..66dd5ec 100644
 +  // nr-sniffer: monitor the RA search space for the RA-RNTIs and TC-RNTIs of other UEs' random access.
 +  // ra->ra_rnti is one of the tracked RNTIs; the PHY accepts any of them (nr_sniffer_match_rnti).
 +  const uint16_t sniffer_ra_rnti = nr_sniffer_hook_ra_watch_rnti();
-+  if (sniffer_ra_rnti && mac->state != UE_PERFORMING_RA && pdcch_config->ra_SS_id >= 0) {
++  if (sniffer_ra_rnti && !mac->sniffer_shadow && mac->state != UE_PERFORMING_RA && pdcch_config->ra_SS_id >= 0) {
 +    const NR_SearchSpace_t *ra_SS = get_common_search_space(mac, pdcch_config->ra_SS_id);
 +    if (ra_SS && is_ss_monitor_occasion(frame, slot, slots_per_frame, ra_SS)) {
 +      ra->ra_rnti = sniffer_ra_rnti;
@@ -386,7 +513,7 @@ index ad89949..66dd5ec 100644
      const NR_SearchSpace_t *ra_SS = get_common_search_space(mac, pdcch_config->ra_SS_id);
      // if RA is ongoing use RA search space
 diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
-index d7d1031..5fd01b0 100644
+index d7d1031..92afb2c 100644
 --- a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
 +++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
 @@ -31,6 +31,7 @@
@@ -409,7 +536,7 @@ index d7d1031..5fd01b0 100644
      rnti_type = TYPE_RA_RNTI_;
    } else if (rnti == ra->MsgB_rnti && (ra->ra_state == nrRA_WAIT_MSGB || ra->ra_state == nrRA_WAIT_CONTENTION_RESOLUTION)) {
      rnti_type = TYPE_MSGB_RNTI_;
-@@ -194,6 +198,22 @@ void nr_ue_decode_mib(NR_UE_MAC_INST_t *mac, int cc_id)
+@@ -194,6 +198,23 @@ void nr_ue_decode_mib(NR_UE_MAC_INST_t *mac, int cc_id)
    mac->ssb_subcarrier_offset = ssb_subcarrier_offset;
    mac->dmrs_TypeA_Position = mac->mib->dmrs_TypeA_Position;
  
@@ -428,11 +555,12 @@ index d7d1031..5fd01b0 100644
 +      .intra_freq_reselection = mac->mib->intraFreqReselection,
 +      .fr2 = mac->frequency_range == FR2,
 +  };
-+  nr_sniffer_hook_mib(&sniffer_mib);
++  if (!mac->sniffer_shadow) // a shadow MAC instance replays the MIB the sniffer already logged
++    nr_sniffer_hook_mib(&sniffer_mib);
  }
  
  static void configure_ratematching_csi(fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_pdu,
-@@ -517,6 +537,44 @@ static void set_harq_status(NR_UE_MAC_INST_t *mac,
+@@ -517,6 +538,44 @@ static void set_harq_status(NR_UE_MAC_INST_t *mac,
          current_harq->dai_cumul);
  }
  
@@ -477,7 +605,7 @@ index d7d1031..5fd01b0 100644
  static int nr_ue_process_dci_ul_00(NR_UE_MAC_INST_t *mac,
                                     frame_t frame,
                                     int slot,
-@@ -578,6 +636,18 @@ static int nr_ue_process_dci_ul_00(NR_UE_MAC_INST_t *mac,
+@@ -578,6 +637,18 @@ static int nr_ue_process_dci_ul_00(NR_UE_MAC_INST_t *mac,
                                  NR_UL_DCI_FORMAT_0_0);
    if (ret != 0)
      remove_ul_config_last_item(pdu);
@@ -496,7 +624,7 @@ index d7d1031..5fd01b0 100644
    release_ul_config(pdu, false);
    return ret;
  }
-@@ -683,6 +753,18 @@ static int nr_ue_process_dci_ul_01(NR_UE_MAC_INST_t *mac,
+@@ -683,6 +754,18 @@ static int nr_ue_process_dci_ul_01(NR_UE_MAC_INST_t *mac,
          0);
    if (ret != 0)
      remove_ul_config_last_item(pdu);
@@ -515,7 +643,7 @@ index d7d1031..5fd01b0 100644
    release_ul_config(pdu, false);
    return ret;
  }
-@@ -959,7 +1041,7 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
+@@ -959,7 +1042,7 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
    } else {
      dlsch_pdu->SubcarrierSpacing = current_DL_BWP->scs;
      if (rnti_type == TYPE_RA_RNTI_) {
@@ -524,7 +652,7 @@ index d7d1031..5fd01b0 100644
          dl_conf_req->pdu_type = FAPI_NR_DL_CONFIG_TYPE_RA_DLSCH;
        } else {
          // Discard the DCI
-@@ -1230,6 +1312,17 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
+@@ -1230,6 +1313,17 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
  
    LOG_D(MAC, "(nr_ue_procedures.c) pdu_type=%d\n", dl_conf_req->pdu_type);
  
@@ -542,7 +670,7 @@ index d7d1031..5fd01b0 100644
    // the prepared dci is valid, we add it in the list
    dl_config->number_pdus++;
    return 0;
-@@ -1614,6 +1707,17 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
+@@ -1614,6 +1708,17 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
    }
    // the prepared dci is valid, we add it in the list
    dl_conf_req->pdu_type = FAPI_NR_DL_CONFIG_TYPE_DLSCH;
@@ -560,7 +688,7 @@ index d7d1031..5fd01b0 100644
    dl_config->number_pdus++; // The DCI configuration is valid, we add it in the list
    return 0;
  }
-@@ -3417,6 +3521,12 @@ static void nr_ue_process_rar(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *d
+@@ -3417,6 +3522,12 @@ static void nr_ue_process_rar(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *d
      LOG_W(NR_MAC,"[UE %d][RAPROC][%d.%d] CRC check failed on RAR (NAK)\n", mac->ue_id, frame, slot);
      return;
    }
@@ -573,23 +701,26 @@ index d7d1031..5fd01b0 100644
  
    RA_config_t *ra = &mac->ra;
    ra->t_crnti = 0;
-@@ -4297,6 +4407,15 @@ static void nr_ue_process_mac_pdu(NR_UE_MAC_INST_t *mac, nr_downlink_indication_
-             nr_ra_contention_resolution_failed(mac);
-             return;
-           }
-+        } else {
-+          // nr-sniffer: Msg4 of another UE. If the sniffer adopts it, its TC-RNTI becomes this MAC's C-RNTI and
-+          // the RRCSetup in this PDU configures this MAC like that UE.
-+          const uint16_t adopted = nr_sniffer_hook_contention_resolution(&pduP[1], frameP, slot);
-+          if (adopted) {
-+            ra->t_crnti = adopted;
-+            nr_timer_start(&mac->time_alignment_timer);
-+            nr_ra_succeeded(mac, frameP, slot);
-+          }
-         }
-         break;
-       case DL_SCH_LCID_PADDING:
-@@ -4450,7 +4569,9 @@ void nr_ue_send_sdu(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info, in
+@@ -4143,6 +4254,18 @@ static void nr_ue_process_mac_pdu(NR_UE_MAC_INST_t *mac, nr_downlink_indication_
+     return;
+   }
+ 
++  // nr-sniffer: another UE's Msg4. Its RRCSetup configures a shadow MAC instance for that UE, never this MAC.
++  uint16_t follow_rnti = 0;
++  void *follow_cg = NULL;
++  int follow_instance = -1;
++  if (nr_sniffer_hook_msg4(pduP, pdu_len, frameP, slot, &follow_rnti, &follow_cg, &follow_instance)) {
++    if (follow_cg) {
++      nr_ue_mac_follow_shadow(mac, follow_instance, follow_rnti, follow_cg);
++      ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, follow_cg);
++    }
++    return;
++  }
++
+   T(T_NRUE_MAC_DL_PDU_WITH_DATA, T_INT(mac->crnti), T_INT(frameP), T_INT(slot), T_INT(pdsch_pdu->harq_pid), T_BUFFER(pduP, pdu_len));
+ 
+   LOG_D(MAC,
+@@ -4450,7 +4573,9 @@ void nr_ue_send_sdu(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info, in
        if (mac->data_inactivity_timer)
          nr_timer_start(mac->data_inactivity_timer);
        // DL data arrival during RRC_CONNECTED when UL synchronisation status is "non-synchronised"
@@ -600,6 +731,42 @@ index d7d1031..5fd01b0 100644
          trigger_MAC_UE_RA(mac, NULL);
          break;
        }
+diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
+index 45ff543..7656089 100644
+--- a/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
++++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
+@@ -15,6 +15,7 @@
+ 
+ /* MAC */
+ #include "NR_MAC_COMMON/nr_mac.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include "NR_MAC_COMMON/nr_mac_common.h"
+ #include "NR_MAC_UE/mac_proto.h"
+ 
+@@ -1328,6 +1329,23 @@ void nr_ue_dl_scheduler(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info
+ 
+   ue_dci_configuration(mac, dl_config, rx_frame, rx_slot);
+ 
++  // nr-sniffer: the search spaces of every followed UE, configured by its shadow MAC instance (C-RNTI hashing,
++  // DMRS scrambling, DCI sizes of that UE), are decoded by this UE's PHY in the same PDCCH pass
++  int shadows[NR_SNIFFER_MAX_SHADOWS];
++  const int nb_shadows = nr_sniffer_hook_shadow_instances(shadows, NR_SNIFFER_MAX_SHADOWS);
++  for (int i = 0; i < nb_shadows; i++) {
++    if (dl_config->number_pdus > FAPI_NR_DL_CONFIG_LIST_NUM - 4) { // keep room for this UE's own PDSCH PDUs
++      LOG_W(NR_MAC, "nr-sniffer: %d.%d DL config full, not monitoring %d followed UEs\n", rx_frame, rx_slot, nb_shadows - i);
++      break;
++    }
++    NR_UE_MAC_INST_t *shadow = get_mac_inst(shadows[i]);
++    if (!shadow)
++      continue;
++    verifyMutex(pthread_mutex_lock(&shadow->if_mutex));
++    ue_dci_configuration(shadow, dl_config, rx_frame, rx_slot);
++    verifyMutex(pthread_mutex_unlock(&shadow->if_mutex));
++  }
++
+   if (mac->ul_time_alignment.ta_apply != no_ta)
+     schedule_ta_command(dl_config, mac);
+ 
 diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c
 index 3a52e52..46e8c5e 100644
 --- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c
@@ -883,8 +1050,42 @@ index f7054f7..1d0b3de 100644
    /// Slots of UL inactivity before an autonomous UL grant is issued to a UE
    uint32_t ulsch_max_frame_inactivity;
  
+diff --git a/openair2/NR_UE_PHY_INTERFACE/NR_IF_Module.c b/openair2/NR_UE_PHY_INTERFACE/NR_IF_Module.c
+index 402cd9b..9723d7c 100644
+--- a/openair2/NR_UE_PHY_INTERFACE/NR_IF_Module.c
++++ b/openair2/NR_UE_PHY_INTERFACE/NR_IF_Module.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "PHY/defs_nr_UE.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include "NR_IF_Module.h"
+ #include "NR_MAC_UE/mac_proto.h"
+ #include "assertions.h"
+@@ -265,6 +266,21 @@ static uint32_t nr_ue_dl_processing(NR_UE_MAC_INST_t *mac, nr_downlink_indicatio
+     LOG_T(MAC, "[L2][IF MODULE][DL INDICATION][DCI_IND]\n");
+     for (int i = 0; i < dl_info->dci_ind->number_of_dcis; i++) {
+       LOG_T(MAC, ">>>NR_IF_Module i=%d, dl_info->dci_ind->number_of_dcis=%d\n", i, dl_info->dci_ind->number_of_dcis);
++      // nr-sniffer: a followed UE's DCI is parsed by that UE's shadow MAC instance, which logs it; what it
++      // schedules (PDSCH reception, PUSCH, HARQ feedback) is dropped
++      const int shadow_id = nr_sniffer_hook_shadow_instance(dl_info->dci_ind->dci_list[i].rnti);
++      NR_UE_MAC_INST_t *shadow = shadow_id > 0 ? get_mac_inst(shadow_id) : NULL;
++      if (shadow) {
++        int ret = pthread_mutex_lock(&shadow->if_mutex);
++        AssertFatal(!ret, "mutex failed %d\n", ret);
++        nr_ue_process_dci_indication_pdu(shadow, dl_info->frame, dl_info->slot, dl_info->dci_ind->dci_list + i);
++        get_dl_config_request(shadow, dl_info->slot)->number_pdus = 0;
++        nr_ue_mac_flush_ul_config(shadow);
++        memset(shadow->def_dci_pdu_rel15[dl_info->slot], 0, sizeof(shadow->def_dci_pdu_rel15[dl_info->slot]));
++        ret = pthread_mutex_unlock(&shadow->if_mutex);
++        AssertFatal(!ret, "mutex failed %d\n", ret);
++        continue;
++      }
+       nr_dci_format_t dci_format = handle_dci(mac, dl_info->frame, dl_info->slot, dl_info->dci_ind->dci_list + i);
+ 
+       /* The check below filters out UL_DCIs which are being processed as DL_DCIs. */
 diff --git a/openair2/RRC/NR_UE/L2_interface_ue.c b/openair2/RRC/NR_UE/L2_interface_ue.c
-index 7a426fb..2935d38 100644
+index 7a426fb..4bf7962 100644
 --- a/openair2/RRC/NR_UE/L2_interface_ue.c
 +++ b/openair2/RRC/NR_UE/L2_interface_ue.c
 @@ -7,6 +7,7 @@
@@ -899,13 +1100,13 @@ index 7a426fb..2935d38 100644
        bool can_start_ra = msg->payload.config_sib1.can_start_ra;
        nr_rrc_mac_config_req_sib1(instance_id, 0, sib1, can_start_ra);
        SEQUENCE_free(&asn_DEF_NR_SIB1, msg->payload.config_sib1.sib1, ASFM_FREE_EVERYTHING);
-+      // nr-sniffer: follow a UE whose configuration is known, as soon as the cell is configured
++      // nr-sniffer: follow UEs whose configuration is known, each in a shadow MAC instance, once the cell is known
 +      uint16_t known_rnti = 0;
-+      NR_CellGroupConfig_t *known_cg = nr_sniffer_hook_known_ue(&known_rnti);
-+      if (known_cg) {
-+        nr_rrc_mac_config_req_cg(instance_id, 0, 0, 0, known_cg, NULL);
++      int known_instance = -1;
++      NR_CellGroupConfig_t *known_cg;
++      while ((known_cg = nr_sniffer_hook_known_ue(&known_rnti, &known_instance))) {
++        nr_ue_mac_follow_shadow(get_mac_inst(instance_id), known_instance, known_rnti, known_cg);
 +        ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, known_cg);
-+        nr_ue_mac_follow_rnti(instance_id, known_rnti);
 +      }
      } break;
      case NR_MAC_RRC_CONFIG_OTHER_SIB: {

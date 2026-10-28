@@ -5,10 +5,11 @@
 #
 # Every process runs with OUT_DIR as its working directory (the phy-test gNB writes reconfig.raw there).
 # Provides: REPO_DIR OAI_DIR BUILD_DIR OUT_DIR TEST_CONF DL_FREQ NRB MU BAND T_DB,
-#           start_gnb [args], start_ue [args], start_sniffer [args], start_gnb_dci_logger,
+#           start_gnb [args], start_ue [args], start_ue_n N [args], start_sniffer [args], start_gnb_dci_logger,
 #           stop_pid PID, and an EXIT trap that stops everything started here.
 # Env:      GNB_CONF (default: OAI's ci-scripts/conf_files/gnb.sa.band78.106prb.rfsim.conf)
 #           OUT_DIR  (default: OUT_DIR_DEFAULT)
+#           SNIFFER_WRAP command prefix for nr-sniffer, e.g. "gdb -batch -ex run -ex bt --args"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OAI_DIR="${1:-$REPO_DIR/oai}"
@@ -84,8 +85,19 @@ start_ue() {
   STARTED_PIDS+=("$UE_PID")
 }
 
+# start_ue_n N [args]: UE number N (its own rfsim connection, IMSI and log ue<N>.log), for multi-UE tests
+start_ue_n() {
+  local n=$1
+  shift
+  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-uesoftmodem" -O "$UE_CONF" "${TUNING[@]}" \
+       --uicc0.imsi "$(printf '2089901000011%02d' "$n")" "$@") > "$OUT_DIR/ue$n.log" 2>&1 &
+  UE_PIDS+=($!)
+  STARTED_PIDS+=($!)
+}
+
 start_sniffer() {
-  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-sniffer" "${TUNING[@]}" "$@") > "$OUT_DIR/sniffer.log" 2>&1 &
+  # SNIFFER_WRAP, e.g. "gdb -batch -ex run -ex bt --args", runs nr-sniffer under a debugger
+  (cd "$OUT_DIR" && exec ${SNIFFER_WRAP:-} "$BUILD_DIR/nr-sniffer" "${TUNING[@]}" "$@") > "$OUT_DIR/sniffer.log" 2>&1 &
   SNIFF_PID=$!
   STARTED_PIDS+=("$SNIFF_PID")
 }
