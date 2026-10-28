@@ -1,0 +1,189 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5e58be3..2295244 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2276,3 +2276,8 @@ endif()
+ if(PACKAGING_LTE OR PACKAGING_NR OR PACKAGING_COMMON OR PACKAGING_USRP OR PACKAGING_PHYSIM)
+   include("tools/packages/packages.cmake")
+ endif()
++
++# nr-sniffer (passive 5G SA telemetry), linked in from the oai-nr-scope repository
++if(EXISTS ${OPENAIR_DIR}/nr-sniffer/CMakeLists.txt)
++  add_subdirectory(${OPENAIR_DIR}/nr-sniffer)
++endif()
+diff --git a/common/utils/nr_sniffer_hooks.h b/common/utils/nr_sniffer_hooks.h
+new file mode 100644
+index 0000000..17f5cd2
+--- /dev/null
++++ b/common/utils/nr_sniffer_hooks.h
+@@ -0,0 +1,77 @@
++/*
++ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
++ */
++
++/*! \file nr_sniffer_hooks.h
++ * \brief Optional hooks used by the nr-sniffer passive telemetry tool.
++ *
++ * The functions below are declared weak. They are only defined by the
++ * nr-sniffer executable. In every other OAI executable (nr-uesoftmodem,
++ * nr-softmodem, ...) they resolve to NULL, the wrappers below do nothing,
++ * and behaviour is unchanged.
++ */
++
++#ifndef NR_SNIFFER_HOOKS_H
++#define NR_SNIFFER_HOOKS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct configmodule_interface configmodule_interface_t;
++
++/// MIB content as decoded by the UE MAC, plus PHY-level cell information.
++typedef struct {
++  int sfn; ///< full 10-bit system frame number
++  int ssb_index; ///< SSB index of the decoded block
++  int half_frame; ///< half-frame bit
++  int pci; ///< physical cell ID from PSS/SSS
++  int ssb_subcarrier_offset; ///< k_SSB (incl. MSB for FR1)
++  int ssb_start_subcarrier; ///< first subcarrier of the SSB in the receiver grid
++  int scs_common; ///< subCarrierSpacingCommon (0: 15/60 kHz, 1: 30/120 kHz)
++  int dmrs_typeA_pos; ///< 0: pos2, 1: pos3
++  int coreset0; ///< pdcch-ConfigSIB1.controlResourceSetZero
++  int searchspace0; ///< pdcch-ConfigSIB1.searchSpaceZero
++  int cell_barred; ///< 0: barred, 1: notBarred (ASN.1 enumeration)
++  int intra_freq_reselection; ///< 0: allowed, 1: notAllowed
++  bool fr2; ///< true if the SSB burst has 64 positions
++} nr_sniffer_mib_t;
++
++void nr_sniffer_init(configmodule_interface_t *cfg) __attribute__((weak));
++void nr_sniffer_on_mib(const nr_sniffer_mib_t *mib) __attribute__((weak));
++/// \p sib1 is a const NR_SIB1_t *; void * keeps this header free of ASN.1 includes.
++void nr_sniffer_on_sib1(const void *sib1, int frame, int slot) __attribute__((weak));
++bool nr_sniffer_is_passive(void) __attribute__((weak));
++
++static inline void nr_sniffer_hook_init(configmodule_interface_t *cfg)
++{
++  if (nr_sniffer_init)
++    nr_sniffer_init(cfg);
++}
++
++static inline void nr_sniffer_hook_mib(const nr_sniffer_mib_t *mib)
++{
++  if (nr_sniffer_on_mib)
++    nr_sniffer_on_mib(mib);
++}
++
++static inline void nr_sniffer_hook_sib1(const void *sib1, int frame, int slot)
++{
++  if (nr_sniffer_on_sib1)
++    nr_sniffer_on_sib1(sib1, frame, slot);
++}
++
++/// True when running as a passive sniffer: the UE stack must never start random access.
++static inline bool nr_sniffer_passive(void)
++{
++  return nr_sniffer_is_passive && nr_sniffer_is_passive();
++}
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/executables/nr-uesoftmodem.c b/executables/nr-uesoftmodem.c
+index f9ebbc1..d18d412 100644
+--- a/executables/nr-uesoftmodem.c
++++ b/executables/nr-uesoftmodem.c
+@@ -64,6 +64,7 @@ unsigned short config_frames[4] = {2,9,11,13};
+ 
+ #include "nr_nas_msg.h"
+ #include "actor.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ 
+ THREAD_STRUCT thread_struct;
+ nrUE_params_t nrUE_params = {0};
+@@ -296,6 +297,7 @@ int main(int argc, char **argv)
+   get_options(uniqCfg); // Command-line options specific for NRUE
+   IS_SOFTMODEM_5GUE = true;
+   get_common_options(uniqCfg);
++  nr_sniffer_hook_init(uniqCfg);
+   CONFIG_CLEARRTFLAG(CONFIG_NOEXITONHELP);
+ 
+   softmodem_verify_mode(get_softmodem_params());
+diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
+index d7d1031..c08f7c1 100644
+--- a/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
++++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c
+@@ -31,6 +31,7 @@
+ #include "oai_asn1.h"
+ #include "common/utils/LOG/log.h"
+ #include "LAYER2/nr_rlc/nr_rlc_oai_api.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ 
+ // #define DEBUG_MIB
+ // #define ENABLE_MAC_PAYLOAD_DEBUG 1
+@@ -194,6 +195,22 @@ void nr_ue_decode_mib(NR_UE_MAC_INST_t *mac, int cc_id)
+   mac->ssb_subcarrier_offset = ssb_subcarrier_offset;
+   mac->dmrs_TypeA_Position = mac->mib->dmrs_TypeA_Position;
+ 
++  const nr_sniffer_mib_t sniffer_mib = {
++      .sfn = mac->mib_frame,
++      .ssb_index = mac->mib_ssb,
++      .half_frame = (extra_bits >> 4) & 0x1,
++      .pci = mac->physCellId,
++      .ssb_subcarrier_offset = ssb_subcarrier_offset,
++      .ssb_start_subcarrier = mac->ssb_start_subcarrier,
++      .scs_common = mac->mib->subCarrierSpacingCommon,
++      .dmrs_typeA_pos = mac->mib->dmrs_TypeA_Position,
++      .coreset0 = mac->mib->pdcch_ConfigSIB1.controlResourceSetZero,
++      .searchspace0 = mac->mib->pdcch_ConfigSIB1.searchSpaceZero,
++      .cell_barred = mac->mib->cellBarred,
++      .intra_freq_reselection = mac->mib->intraFreqReselection,
++      .fr2 = mac->frequency_range == FR2,
++  };
++  nr_sniffer_hook_mib(&sniffer_mib);
+ }
+ 
+ static void configure_ratematching_csi(fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_pdu,
+diff --git a/openair2/RRC/NR_UE/rrc_UE.c b/openair2/RRC/NR_UE/rrc_UE.c
+index c28bf15..7d6fc07 100644
+--- a/openair2/RRC/NR_UE/rrc_UE.c
++++ b/openair2/RRC/NR_UE/rrc_UE.c
+@@ -51,6 +51,7 @@
+ #include "nr_nas_msg.h"
+ #include "openair2/SDAP/nr_sdap/nr_sdap.h"
+ #include "openair2/SDAP/nr_sdap/nr_sdap_entity.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ 
+ static NR_UE_RRC_INST_t *NR_UE_rrc_inst[MAX_NUM_NR_UE_INST] = {0};
+ /* NAS Attach request with IMSI */
+@@ -366,7 +367,7 @@ static void nr_decode_SI(NR_UE_RRC_SI_INFO *SI_info, NR_SystemInformation_t *si,
+     asn_copy(&asn_DEF_NR_SIB19_r17, (void **)&sib19_msg->sib19, sib19);
+     sib19_msg->hfn = hfn;
+     sib19_msg->frame = frame;
+-    sib19_msg->can_start_ra = rrc->is_NTN_UE;
++    sib19_msg->can_start_ra = rrc->is_NTN_UE && !nr_sniffer_passive();
+     nr_rrc_send_msg_to_mac(rrc, &rrc_msg);
+   }
+ }
+@@ -533,7 +534,7 @@ static void nr_rrc_process_sib1(NR_UE_RRC_INST_t *rrc, NR_UE_RRC_SI_INFO *SI_inf
+   rrc_msg.payload_type = NR_MAC_RRC_CONFIG_SIB1;
+   nr_mac_rrc_config_sib1_t *config_sib1 = &rrc_msg.payload.config_sib1;
+   config_sib1->sib1 = sib1;
+-  config_sib1->can_start_ra = !rrc->is_NTN_UE;
++  config_sib1->can_start_ra = !rrc->is_NTN_UE && !nr_sniffer_passive();
+   nr_rrc_send_msg_to_mac(rrc, &rrc_msg);
+ }
+ 
+@@ -2261,6 +2262,7 @@ static void nr_rrc_ue_decode_NR_BCCH_DL_SCH_Message(NR_UE_RRC_INST_t *rrc,
+   if (bcch_message->message.present == NR_BCCH_DL_SCH_MessageType_PR_c1) {
+     switch (bcch_message->message.choice.c1->present) {
+       case NR_BCCH_DL_SCH_MessageType__c1_PR_systemInformationBlockType1:
++        nr_sniffer_hook_sib1(bcch_message->message.choice.c1->choice.systemInformationBlockType1, frame, slot);
+         nr_rrc_process_sib1(rrc, SI_info, bcch_message->message.choice.c1->choice.systemInformationBlockType1);
+         // mac layer will free after usage the sib1
+         bcch_message->message.choice.c1->choice.systemInformationBlockType1 = NULL;
