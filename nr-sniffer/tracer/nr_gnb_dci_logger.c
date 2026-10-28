@@ -3,6 +3,11 @@
  * (GNB_MAC_DCI events) to CSV in the nr-sniffer DCI schema, with source=gnb.
  * This is the ground truth the sniffer's dci.csv is compared against.
  *
+ * With -c <dir> it also saves every CellGroupConfig the gNB sends to a UE (GNB_MAC_CELLGROUP events)
+ * as <dir>/cellgroup_<rnti>_<n>.uper, listed in <dir>/cellgroups.csv. nr-sniffer can follow a UE
+ * with such a file (--sniffer.cellgroup_file, --sniffer.rnti) even when the RRCReconfiguration
+ * carrying it is ciphered.
+ *
  * Run the gNB with --T_stdout 2 (or 0); it waits for this logger to connect.
  */
 
@@ -31,6 +36,11 @@ typedef struct {
   int index[NB_FIELDS];
   FILE *out;
   unsigned long count;
+  /* CellGroupConfig export (-c) */
+  const char *cg_dir;
+  FILE *cg_index;
+  int cg_rnti_field, cg_buffer_field;
+  unsigned long cg_count;
 } logger_t;
 
 /* Every row is flushed when written, so stopping is just exiting. Waiting for the socket to close is not
@@ -75,13 +85,42 @@ static void on_dci(void *priv, event e)
   l->count++;
 }
 
+static void on_cellgroup(void *priv, event e)
+{
+  logger_t *l = priv;
+  const int rnti = e.e[l->cg_rnti_field].i;
+  char name[64], path[600];
+  snprintf(name, sizeof(name), "cellgroup_%04x_%lu.uper", rnti, l->cg_count++);
+  snprintf(path, sizeof(path), "%s/%s", l->cg_dir, name);
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    perror(path);
+    return;
+  }
+  fwrite(e.e[l->cg_buffer_field].b, 1, e.e[l->cg_buffer_field].bsize, f);
+  fclose(f);
+  const uint64_t ts = (uint64_t)e.sending_time.tv_sec * 1000000ULL + e.sending_time.tv_nsec / 1000;
+  fprintf(l->cg_index, "%lu,0x%04x,%d,%s\n", (unsigned long)ts, rnti, e.e[l->cg_buffer_field].bsize, name);
+  fflush(l->cg_index);
+}
+
+static int field_index(database_event_format f, const char *name, const char *type)
+{
+  for (int k = 0; k < f.count; k++)
+    if (!strcmp(f.name[k], name) && !strcmp(f.type[k], type))
+      return k;
+  fprintf(stderr, "fatal: no %s field '%s' (is the nr-sniffer OAI patch applied?)\n", type, name);
+  exit(1);
+}
+
 static void usage(void)
 {
   printf("usage: nr-gnb-dci-logger -d <T_messages.txt> [options]\n"
          "    -d <database>   OAI's common/utils/T/T_messages.txt (mandatory)\n"
          "    -ip <address>   gNB T-tracer address (default %s)\n"
          "    -p <port>       gNB T-tracer port (default %d)\n"
-         "    -o <file>       output CSV (default: stdout)\n",
+         "    -o <file>       output CSV (default: stdout)\n"
+         "    -c <dir>        also save each UE's CellGroupConfig (UPER) in <dir>, indexed in <dir>/cellgroups.csv\n",
          DEFAULT_IP,
          DEFAULT_PORT);
   exit(1);
@@ -93,6 +132,7 @@ int main(int n, char **v)
   char *ip = DEFAULT_IP;
   int port = DEFAULT_PORT;
   char *out_filename = NULL;
+  char *cg_dir = NULL;
 
   for (int i = 1; i < n; i++) {
     if (!strcmp(v[i], "-h") || !strcmp(v[i], "--help")) usage();
@@ -100,6 +140,7 @@ int main(int n, char **v)
     if (!strcmp(v[i], "-ip") && i < n - 1) { ip = v[++i]; continue; }
     if (!strcmp(v[i], "-p") && i < n - 1) { port = atoi(v[++i]); continue; }
     if (!strcmp(v[i], "-o") && i < n - 1) { out_filename = v[++i]; continue; }
+    if (!strcmp(v[i], "-c") && i < n - 1) { cg_dir = v[++i]; continue; }
     usage();
   }
   if (!database_filename)
@@ -109,7 +150,7 @@ int main(int n, char **v)
   load_config_file(database_filename);
   event_handler *h = new_handler(database);
 
-  logger_t l = {.out = stdout};
+  logger_t l = {.out = stdout, .cg_dir = cg_dir};
   const int ev_id = event_id_from_name(database, "GNB_MAC_DCI");
   const database_event_format f = get_format(database, ev_id);
   for (size_t i = 0; i < NB_FIELDS; i++) {
@@ -141,6 +182,23 @@ int main(int n, char **v)
   if (!is_on)
     abort();
   on_off(database, "GNB_MAC_DCI", is_on, 1);
+  if (cg_dir) {
+    const int cg_id = event_id_from_name(database, "GNB_MAC_CELLGROUP");
+    const database_event_format cf = get_format(database, cg_id);
+    l.cg_rnti_field = field_index(cf, "rnti", "int");
+    l.cg_buffer_field = field_index(cf, "cellgroup", "buffer");
+    char path[600];
+    snprintf(path, sizeof(path), "%s/cellgroups.csv", cg_dir);
+    l.cg_index = fopen(path, "w");
+    if (!l.cg_index) {
+      perror(path);
+      exit(1);
+    }
+    fprintf(l.cg_index, "timestamp_us,rnti,length,file\n");
+    fflush(l.cg_index);
+    on_off(database, "GNB_MAC_CELLGROUP", is_on, 1);
+    register_handler_function(h, cg_id, on_cellgroup, &l);
+  }
   char mt = 1;
   if (socket_send(in, &mt, 1) == -1 || socket_send(in, &nb_events, sizeof(int)) == -1
       || socket_send(in, is_on, nb_events * sizeof(int)) == -1) {
@@ -149,7 +207,8 @@ int main(int n, char **v)
   }
   free(is_on);
   register_handler_function(h, ev_id, on_dci, &l);
-  fprintf(stderr, "nr-gnb-dci-logger: connected to %s:%d, logging GNB_MAC_DCI\n", ip, port);
+  fprintf(stderr, "nr-gnb-dci-logger: connected to %s:%d, logging GNB_MAC_DCI%s\n", ip, port,
+          cg_dir ? " and GNB_MAC_CELLGROUP" : "");
 
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);

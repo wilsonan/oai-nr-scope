@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Compare the DCIs nr-sniffer decoded for the UE it followed with the gNB ground truth (component C, first cut).
 
-Usage: compare_dci.py <gnb.log> <gnb_dci.csv> <sniffer out_dir> [--ue-log ue.log] [--sniffer-log sniffer.log]
+Usage: compare_dci.py <gnb.log> <gnb_dci.csv> <sniffer out_dir> [--rnti 0x1234] [--ue-log ue.log] [--sniffer-log sniffer.log]
 
-The UE is identified from the gNB log (RA-RNTI and TC-RNTI of its random access). DCIs are matched on
-(sfn, slot, rnti, direction) with timestamps within 1 s, since SFN wraps every 10.24 s. Only the
-window in which both logs were recording counts: from the gNB's RAR DCI for the UE to the last DCI
-either side logged. Exits 0 when the sniffer followed the UE, stayed passive, and its DCIs match.
+Without --rnti the UE is identified from the gNB log (RA-RNTI and TC-RNTI of its random access) and
+the sniffer must have followed it through RAR and Msg4; the window starts at the gNB's RAR DCI.
+With --rnti (known configuration, phy-test) there is no random access to check; the window starts
+when the sniffer started following (ue.csv + 100 ms), or at its first DCI for the RNTI in phy-test.
+DCIs are matched on (sfn, slot, rnti, direction) with timestamps within 1 s, since SFN wraps every
+10.24 s. The window ends at the last DCI either side logged. Exits 0 when the sniffer stayed passive
+and its DCIs match.
 """
 import argparse
 import csv
@@ -31,6 +34,7 @@ def main():
     ap.add_argument("gnb_log")
     ap.add_argument("gnb_dci")
     ap.add_argument("sniffer_dir")
+    ap.add_argument("--rnti", help="C-RNTI of a UE followed with a known configuration")
     ap.add_argument("--ue-log")
     ap.add_argument("--sniffer-log")
     a = ap.parse_args()
@@ -51,25 +55,32 @@ def main():
         results.append(ok)
         print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
-    m = re.search(r"UE RA-RNTI ([0-9a-f]+) TC-RNTI ([0-9a-f]+): initiating RA procedure", log)
-    if not m:
-        check("gnb log", False, "no RA procedure in the gNB log")
-        return finish(results)
-    ra_rnti, rnti = f"0x{int(m.group(1), 16):04x}", f"0x{int(m.group(2), 16):04x}"
+    known = a.rnti is not None
+    if known:
+        rnti, ra_rnti = f"0x{int(a.rnti, 16):04x}", None
+        followed = ue[0]["c_rnti"] if ue else None
+        if ue:
+            check("known UE", followed == rnti, f"sniffer follows C-RNTI {followed} with a known configuration")
+    else:
+        m = re.search(r"UE RA-RNTI ([0-9a-f]+) TC-RNTI ([0-9a-f]+): initiating RA procedure", log)
+        if not m:
+            check("gnb log", False, "no RA procedure in the gNB log")
+            return finish(results)
+        ra_rnti, rnti = f"0x{int(m.group(1), 16):04x}", f"0x{int(m.group(2), 16):04x}"
 
-    # --- random access tracking
-    check("RAR", any(r["tc_rnti"] == rnti for r in rar),
-          f"sniffer decoded a RAR with TC-RNTI {rnti}" if any(r["tc_rnti"] == rnti for r in rar)
-          else f"no RAR with TC-RNTI {rnti} in rar.csv ({len(rar)} RARs)")
-    followed = ue[0]["c_rnti"] if ue else None
-    check("Msg4", followed == rnti, f"sniffer follows C-RNTI {followed}, gNB TC-RNTI {rnti}")
+        # --- random access tracking
+        check("RAR", any(r["tc_rnti"] == rnti for r in rar),
+              f"sniffer decoded a RAR with TC-RNTI {rnti}" if any(r["tc_rnti"] == rnti for r in rar)
+              else f"no RAR with TC-RNTI {rnti} in rar.csv ({len(rar)} RARs)")
+        followed = ue[0]["c_rnti"] if ue else None
+        check("Msg4", followed == rnti, f"sniffer follows C-RNTI {followed}, gNB TC-RNTI {rnti}")
 
     # --- passivity: every PRACH the gNB detected was sent by the UE, and the gNB knows only one UE
     gnb_prach = len(re.findall(r"\[RAPROC\] [0-9.]+ Initiating RA procedure", log))
     ue_prach = len(re.findall(r"PRACH \[UE \d+\] in frame\.slot", strip(open(ue_log, errors="replace").read())))
     sniffer_prach = len(re.findall(r"PRACH \[UE \d+\] in frame\.slot", strip(open(sniffer_log, errors="replace").read())))
     contexts = len(re.findall(r"Create UE context", log))
-    check("passive", gnb_prach == ue_prach and sniffer_prach == 0 and contexts == 1,
+    check("passive", gnb_prach == ue_prach and sniffer_prach == 0 and contexts <= 1,
           f"gNB detected {gnb_prach} PRACH, the UE sent {ue_prach}, the sniffer sent {sniffer_prach}; "
           f"gNB UE contexts {contexts}")
 
@@ -78,12 +89,25 @@ def main():
     mine = lambda rows: [r for r in rows if r["rnti"] in (rnti, ra_rnti) and r["rnti_type"] in ("ra", "tc", "c")
                          and (r["rnti"] == rnti or r["rnti_type"] == "ra")]
     g, s = mine(gnb), mine(sniff)
-    g_rar = [r for r in g if r["rnti"] == ra_rnti]
-    if not g or not g_rar:
-        check("ground truth", False, f"no gNB DCI for RA-RNTI {ra_rnti} / RNTI {rnti}")
-        return finish(results)
-    start = ts(g_rar[0]) - MATCH_WINDOW_US
-    g = [r for r in g if ts(r) >= ts(g_rar[0]) and (r["rnti"] == rnti or r is g_rar[0])]
+    if known:
+        g = [r for r in g if r["rnti"] == rnti]
+        s = [r for r in s if r["rnti"] == rnti]
+        if not g or not s:
+            check("ground truth", False, f"{len(g)} gNB and {len(s)} sniffer DCIs for RNTI {rnti}")
+            return finish(results)
+        # the gNB stamps a DCI a few ms before the sniffer does (it schedules ahead), so match on a wider
+        # window and apply the start, in sniffer time, to the pairs afterwards
+        first = int(ue[0]["timestamp_us"]) + 100_000 if ue else ts(s[0])
+        start = first - MATCH_WINDOW_US
+        g = [r for r in g if ts(r) >= start]
+    else:
+        first = None
+        g_rar = [r for r in g if r["rnti"] == ra_rnti]
+        if not g or not g_rar:
+            check("ground truth", False, f"no gNB DCI for RA-RNTI {ra_rnti} / RNTI {rnti}")
+            return finish(results)
+        start = ts(g_rar[0]) - MATCH_WINDOW_US
+        g = [r for r in g if ts(r) >= ts(g_rar[0]) and (r["rnti"] == rnti or r is g_rar[0])]
     end = min(ts(g[-1]), ts(s[-1]) if s else 0) - 100_000  # both sides stop at different times
     g = [r for r in g if ts(r) <= end]
     s = [r for r in s if start <= ts(r) <= end + MATCH_WINDOW_US]
@@ -102,6 +126,11 @@ def main():
         else:
             missed.append(r)
     false_pos = [c for c in s if id(c) not in used and ts(c) <= end]
+    if first is not None:
+        matched = [(r, c) for r, c in matched if ts(c) >= first]
+        missed = [r for r in missed if ts(r) >= first]
+        false_pos = [c for c in false_pos if ts(c) >= first]
+        g = [r for r, _ in matched] + missed
 
     n = len(g)
     per_dir = {d: sum(1 for r in g if r["direction"] == d) for d in ("dl", "ul")}

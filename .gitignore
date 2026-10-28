@@ -2,3 +2,5 @@ oai/
 rfsim-test-out/
 gnb-dci-test-out/
 dci-test-out/
+phytest-dci-test-out/
+known-ue-test-out/

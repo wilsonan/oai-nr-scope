@@ -3,6 +3,7 @@
 #
 #   OUT_DIR_DEFAULT=$PWD/some-test-out; source "$(dirname "$0")/rfsim_common.sh" "$@"
 #
+# Every process runs with OUT_DIR as its working directory (the phy-test gNB writes reconfig.raw there).
 # Provides: REPO_DIR OAI_DIR BUILD_DIR OUT_DIR TEST_CONF DL_FREQ NRB MU BAND T_DB,
 #           start_gnb [args], start_ue [args], start_sniffer [args], start_gnb_dci_logger,
 #           stop_pid PID, and an EXIT trap that stops everything started here.
@@ -62,28 +63,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# start_gnb_dci_logger [logger args], e.g. -c DIR to also save each UE's CellGroupConfig
 start_gnb_dci_logger() {
-  "$BUILD_DIR/nr-gnb-dci-logger" -d "$T_DB" -o "$OUT_DIR/gnb_dci.csv" 2> "$OUT_DIR/gnb_dci_logger.log" &
+  "$BUILD_DIR/nr-gnb-dci-logger" -d "$T_DB" -o "$OUT_DIR/gnb_dci.csv" "$@" 2> "$OUT_DIR/gnb_dci_logger.log" &
   LOGGER_PID=$!
   STARTED_PIDS+=("$LOGGER_PID")
 }
 
 start_gnb() {
-  (cd "$BUILD_DIR" && exec ./nr-softmodem -O "$TEST_CONF" --rfsim --rfsimulator.[0].serveraddr server "$@") \
+  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-softmodem" -O "$TEST_CONF" --rfsim --rfsimulator.[0].serveraddr server "$@") \
       > "$OUT_DIR/gnb.log" 2>&1 &
   GNB_PID=$!
   STARTED_PIDS+=("$GNB_PID")
 }
 
 start_ue() {
-  (cd "$BUILD_DIR" && exec ./nr-uesoftmodem -O "$UE_CONF" "${TUNING[@]}" --uicc0.imsi 208990100001100 "$@") \
+  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-uesoftmodem" -O "$UE_CONF" "${TUNING[@]}" --uicc0.imsi 208990100001100 "$@") \
       > "$OUT_DIR/ue.log" 2>&1 &
   UE_PID=$!
   STARTED_PIDS+=("$UE_PID")
 }
 
 start_sniffer() {
-  (cd "$BUILD_DIR" && exec ./nr-sniffer "${TUNING[@]}" "$@") > "$OUT_DIR/sniffer.log" 2>&1 &
+  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-sniffer" "${TUNING[@]}" "$@") > "$OUT_DIR/sniffer.log" 2>&1 &
   SNIFF_PID=$!
   STARTED_PIDS+=("$SNIFF_PID")
 }

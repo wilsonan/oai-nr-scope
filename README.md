@@ -28,8 +28,17 @@ sees no transmission from the sniffer.
 - [x] Msg4/RRCSetup → follow the UE with OAI's own UE MAC/RRC (`ue.csv`)
 - [x] DCI 0_0/0_1/1_0/1_1 logging with PRBs, MCS, TBS, HARQ (`dci.csv`, same schema as the gNB logger)
 - [x] All UL dropped when passive; `scripts/compare_dci.py` checks miss rate, false positives, fields, passivity
-- [ ] DCI 0_1/1_1 exercised end to end. Without a core the gNB never leaves the common SS; see
-      [doc/DESIGN.md](doc/DESIGN.md#milestone-2-results-and-limits)
+- [x] DCI 0_1/1_1 exercised end to end, in phy-test (M3 below). Without a core the SA gNB never leaves
+      the common SS; see [doc/DESIGN.md](doc/DESIGN.md#milestone-2-results-and-limits)
+
+Milestone 3 is **in progress**:
+
+- [x] Known configuration (NR-Scope `fixed_rnti`): `--sniffer.cellgroup_file` + `--sniffer.rnti`.
+      `nr-gnb-dci-logger -c` exports each UE's CellGroupConfig from the gNB, even when the
+      RRCReconfiguration that carries it is ciphered
+- [x] `scripts/phytest_dci_test.sh`: phy-test, DCI 1_1/0_1, 0 of 28 648 missed
+- [x] `scripts/known_ue_test.sh`: SA, sniffer started after the UE attached, 0 of 421 missed
+- [ ] Several UEs at once (multi-RNTI refactor), worker pool, multi-UE evaluation report
 
 ## Quick start
 
@@ -40,6 +49,8 @@ scripts/build.sh                        # nr-sniffer, nr-softmodem, nr-uesoftmod
 scripts/rfsim_test.sh                   # gNB (rfsim) + sniffer, checks MIB/SIB1 against the gNB config
 scripts/gnb_dci_test.sh                 # gNB (rfsim, T-tracer) + nr-gnb-dci-logger + one UE
 scripts/dci_test.sh                     # + nr-sniffer following the UE; compares its DCIs with the gNB's
+scripts/phytest_dci_test.sh             # phy-test gNB/UE/sniffer, DCI 0_1/1_1 with a known configuration
+scripts/known_ue_test.sh                # SA, sniffer joins late with the UE's CellGroupConfig from the gNB
 ```
 
 Running the sniffer against a cell (start it before the UEs you want to follow attach):
@@ -80,7 +91,14 @@ already uses `AF_UNSPEC`.
 
 ```bash
 ./nr-softmodem -O gnb.conf --rfsim ... --T_stdout 2   # T-tracer on; waits for a tracer to connect
-./nr-gnb-dci-logger -d ../../../common/utils/T/T_messages.txt -o gnb_dci.csv
+./nr-gnb-dci-logger -d ../../../common/utils/T/T_messages.txt -o gnb_dci.csv -c cellgroups/
+```
+
+`-c` saves each UE's CellGroupConfig, so the sniffer can follow a UE that is already connected:
+
+```bash
+./nr-sniffer -C 3319680000 -r 106 --numerology 1 --band 78 ... \
+    --sniffer.cellgroup_file cellgroups/cellgroup_1a2b_0.uper --sniffer.rnti 0x1a2b
 ```
 
 The OAI patch adds a `GNB_MAC_DCI` T event (see [doc/DESIGN.md](doc/DESIGN.md)). It is free when

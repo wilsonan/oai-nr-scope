@@ -14,6 +14,8 @@
 #include "common/utils/nr/nr_common.h"
 #include "openair2/LAYER2/NR_MAC_COMMON/nr_mac_common.h"
 #include "openair2/LAYER2/NR_MAC_COMMON/nr_prach_config.h"
+#include "NR_CellGroupConfig.h"
+#include "NR_RRCReconfiguration.h"
 #include "NR_SIB1.h"
 #include "NR_ServingCellConfigCommonSIB.h"
 #include "nr_sniffer_csv.h"
@@ -39,6 +41,8 @@ static struct {
   uint16_t last_tc_dl; ///< TC-RNTI of the last DL DCI on a TC-RNTI (the Msg4 the next contention resolution belongs to)
   nr_sniffer_csv_t rar_csv;
   nr_sniffer_csv_t ue_csv;
+  NR_CellGroupConfig_t *known_cg; ///< configuration of a UE to follow from the start (handed to the MAC once)
+  uint16_t known_rnti;
 } R = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
 void nr_sniffer_ra_init(const char *out_dir, bool follow)
@@ -214,4 +218,94 @@ void nr_sniffer_ra_on_dci(const nr_sniffer_dci_t *dci)
     R.last_tc_dl = dci->rnti;
     pthread_mutex_unlock(&R.lock);
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* known configuration (NR-Scope fixed_rnti)                                 */
+/* ------------------------------------------------------------------------- */
+
+static NR_CellGroupConfig_t *decode_cellgroup(const uint8_t *buf, int len)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  asn_dec_rval_t r = uper_decode_complete(NULL, &asn_DEF_NR_CellGroupConfig, (void **)&cg, buf, len);
+  if (r.code == RC_OK && r.consumed == len)
+    return cg;
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return NULL;
+}
+
+/* the CellGroupConfig carried by an RRCReconfiguration: masterCellGroup (SA) or secondaryCellGroup (NSA, phy-test) */
+static NR_CellGroupConfig_t *cellgroup_from_reconfiguration(const uint8_t *buf, int len)
+{
+  NR_RRCReconfiguration_t *rec = NULL;
+  NR_CellGroupConfig_t *cg = NULL;
+  asn_dec_rval_t r = uper_decode_complete(NULL, &asn_DEF_NR_RRCReconfiguration, (void **)&rec, buf, len);
+  if (r.code == RC_OK && r.consumed == len && rec->criticalExtensions.present == NR_RRCReconfiguration__criticalExtensions_PR_rrcReconfiguration) {
+    const NR_RRCReconfiguration_IEs_t *ies = rec->criticalExtensions.choice.rrcReconfiguration;
+    const OCTET_STRING_t *os = ies->secondaryCellGroup;
+    if (!os && ies->nonCriticalExtension)
+      os = ies->nonCriticalExtension->masterCellGroup;
+    if (os)
+      cg = decode_cellgroup(os->buf, os->size);
+  }
+  ASN_STRUCT_FREE(asn_DEF_NR_RRCReconfiguration, rec);
+  return cg;
+}
+
+bool nr_sniffer_ra_load_known_ue(const char *path, int rnti)
+{
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "[SNIFFER] cannot open cellgroup_file %s\n", path);
+    return false;
+  }
+  uint8_t buf[16384];
+  const int len = fread(buf, 1, sizeof(buf), f);
+  fclose(f);
+  NR_CellGroupConfig_t *cg = decode_cellgroup(buf, len);
+  const char *kind = "CellGroupConfig";
+  if (!cg) {
+    cg = cellgroup_from_reconfiguration(buf, len);
+    kind = "RRCReconfiguration";
+  }
+  if (!cg) {
+    fprintf(stderr, "[SNIFFER] %s is neither a UPER CellGroupConfig nor an RRCReconfiguration\n", path);
+    return false;
+  }
+  /* reconfigurationWithSync would make the MAC re-synchronise and do random access; in SA the cell
+   * configuration comes from SIB1, so only its newUE-Identity is kept */
+  if (cg->spCellConfig && cg->spCellConfig->reconfigurationWithSync) {
+    if (rnti < 0)
+      rnti = cg->spCellConfig->reconfigurationWithSync->newUE_Identity;
+    ASN_STRUCT_FREE(asn_DEF_NR_ReconfigurationWithSync, cg->spCellConfig->reconfigurationWithSync);
+    cg->spCellConfig->reconfigurationWithSync = NULL;
+  }
+  if (rnti <= 0 || rnti > 0xffef) {
+    fprintf(stderr, "[SNIFFER] cellgroup_file %s: give the UE's C-RNTI with --sniffer.rnti\n", path);
+    ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+    return false;
+  }
+  pthread_mutex_lock(&R.lock);
+  R.known_cg = cg;
+  R.known_rnti = rnti;
+  R.adopted = rnti; /* do not adopt another UE through random access */
+  pthread_mutex_unlock(&R.lock);
+  printf("[SNIFFER] Known configuration: %s from %s (%d bytes) for C-RNTI %04x\n", kind, path, len, rnti);
+  fflush(stdout);
+  return true;
+}
+
+void *nr_sniffer_known_ue(uint16_t *rnti)
+{
+  pthread_mutex_lock(&R.lock);
+  NR_CellGroupConfig_t *cg = R.known_cg;
+  R.known_cg = NULL;
+  *rnti = R.known_rnti;
+  if (cg) {
+    nr_sniffer_csv_row(&R.ue_csv, "%lu,-1,-1,0x%04x,known", nr_sniffer_now_us(), R.known_rnti);
+    printf("[SNIFFER] SIB1 applied: following UE with C-RNTI %04x (known configuration)\n", R.known_rnti);
+    fflush(stdout);
+  }
+  pthread_mutex_unlock(&R.lock);
+  return cg;
 }

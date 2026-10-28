@@ -12,13 +12,17 @@ index 5e58be3..a89d739 100644
 +  add_subdirectory(${OPENAIR_DIR}/nr-sniffer ${CMAKE_BINARY_DIR}/nr-sniffer-build)
 +endif()
 diff --git a/common/utils/T/T_messages.txt b/common/utils/T/T_messages.txt
-index 954017a..887a2ee 100644
+index 954017a..23c7849 100644
 --- a/common/utils/T/T_messages.txt
 +++ b/common/utils/T/T_messages.txt
-@@ -265,6 +265,10 @@ ID = GNB_MAC_LCID_UL
+@@ -265,6 +265,14 @@ ID = GNB_MAC_LCID_UL
      DESC = NR MAC uplink traffic received for an UE for a specific LCID
      GROUP = ALL:MAC:GNB
      FORMAT = int,rnti : int,frame : int,slot : int,lcid : int,data_size
++ID = GNB_MAC_CELLGROUP
++    DESC = NR MAC CellGroupConfig (UPER) the DU sends to the CU for a UE (RRCSetup / RRCReconfiguration content)
++    GROUP = ALL:MAC:GNB
++    FORMAT = int,rnti : buffer,cellgroup
 +ID = GNB_MAC_DCI
 +    DESC = NR MAC DCI sent on PDCCH in frame.slot, with the PDSCH/PUSCH it schedules (prb_start relative to the BWP, tbs in bits)
 +    GROUP = ALL:MAC:GNB
@@ -28,10 +32,10 @@ index 954017a..887a2ee 100644
  ID = ENB_RLC_DL
 diff --git a/common/utils/nr_sniffer_hooks.h b/common/utils/nr_sniffer_hooks.h
 new file mode 100644
-index 0000000..fb037a9
+index 0000000..5cda41b
 --- /dev/null
 +++ b/common/utils/nr_sniffer_hooks.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,151 @@
 +/*
 + * SPDX-License-Identifier: LicenseRef-CSSL-1.0
 + */
@@ -49,6 +53,7 @@ index 0000000..fb037a9
 +#define NR_SNIFFER_HOOKS_H
 +
 +#include <stdbool.h>
++#include <stddef.h>
 +#include <stdint.h>
 +
 +#ifdef __cplusplus
@@ -109,6 +114,9 @@ index 0000000..fb037a9
 +/// UE MAC: a UE Contention Resolution Identity MAC CE (Msg4) was decoded. Returns the TC-RNTI it was sent
 +/// on if the sniffer adopts that UE (its C-RNTI and configuration become this MAC's), or 0.
 +uint16_t nr_sniffer_on_contention_resolution(const uint8_t *cont_res_id, int frame, int slot) __attribute__((weak));
++/// UE MAC, once SIB1 is applied: a UE to follow with a known configuration. Returns a NR_CellGroupConfig_t *
++/// (the caller applies and frees it) and sets \p rnti, once; NULL otherwise.
++void *nr_sniffer_known_ue(uint16_t *rnti) __attribute__((weak));
 +
 +static inline void nr_sniffer_hook_init(configmodule_interface_t *cfg)
 +{
@@ -162,6 +170,11 @@ index 0000000..fb037a9
 +    return false;
 +  nr_sniffer_on_rar(pdu, len, frame, slot);
 +  return true;
++}
++
++static inline void *nr_sniffer_hook_known_ue(uint16_t *rnti)
++{
++  return nr_sniffer_known_ue ? nr_sniffer_known_ue(rnti) : NULL;
 +}
 +
 +static inline uint16_t nr_sniffer_hook_contention_resolution(const uint8_t *cont_res_id, int frame, int slot)
@@ -275,6 +288,44 @@ index 1a8b22e..6e8c3da 100644
    while (pdu->pdu_type != FAPI_NR_END) {
      switch (pdu->pdu_type) {
        case FAPI_NR_UL_CONFIG_TYPE_PUSCH: {
+diff --git a/openair2/LAYER2/NR_MAC_UE/config_ue.c b/openair2/LAYER2/NR_MAC_UE/config_ue.c
+index aad37a4..dfa5e6b 100644
+--- a/openair2/LAYER2/NR_MAC_UE/config_ue.c
++++ b/openair2/LAYER2/NR_MAC_UE/config_ue.c
+@@ -2949,6 +2949,19 @@ static void handle_mac_uecap_info(NR_UE_MAC_INST_t *mac, NR_UE_NR_Capability_t *
+   }
+ }
+ 
++void nr_ue_mac_follow_rnti(module_id_t module_id, uint16_t rnti)
++{
++  NR_UE_MAC_INST_t *mac = get_mac_inst(module_id);
++  int ret = pthread_mutex_lock(&mac->if_mutex);
++  AssertFatal(!ret, "mutex failed %d\n", ret);
++  LOG_A(NR_MAC, "[UE %d] Following C-RNTI %04x with a known configuration\n", module_id, rnti);
++  mac->crnti = rnti;
++  mac->state = UE_CONNECTED;
++  nr_timer_start(&mac->time_alignment_timer);
++  ret = pthread_mutex_unlock(&mac->if_mutex);
++  AssertFatal(!ret, "mutex failed %d\n", ret);
++}
++
+ void nr_rrc_mac_config_req_cg(module_id_t module_id,
+                               int cc_idP,
+                               int hfn,
+diff --git a/openair2/LAYER2/NR_MAC_UE/mac_proto.h b/openair2/LAYER2/NR_MAC_UE/mac_proto.h
+index dd2ab39..7466e1f 100644
+--- a/openair2/LAYER2/NR_MAC_UE/mac_proto.h
++++ b/openair2/LAYER2/NR_MAC_UE/mac_proto.h
+@@ -56,6 +56,9 @@ void release_dl_BWP(NR_UE_MAC_INST_t *mac, int index);
+ void release_ul_BWP(NR_UE_MAC_INST_t *mac, int index);
+ void nr_release_mac_config_logicalChannelBearer(NR_UE_MAC_INST_t *mac, long channel_identity);
+ 
++/// nr-sniffer: take \p rnti as this MAC's C-RNTI and consider the UE connected (its CellGroupConfig is applied)
++void nr_ue_mac_follow_rnti(module_id_t module_id, uint16_t rnti);
++
+ void nr_rrc_mac_config_req_cg(module_id_t module_id,
+                               int cc_idP,
+                               int hfn,
 diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c b/openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c
 index b725793..a854191 100644
 --- a/openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c
@@ -674,13 +725,20 @@ index 1e1ec50..707ad04 100644
  
  /** @brief Returns true if (frame, slot) is a paging occasion (PO) for a given UE.
 diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
-index 93a6372..f2a040a 100644
+index 93a6372..3ce4cc4 100644
 --- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
 +++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
-@@ -1817,6 +1817,42 @@ static void prepare_dci_X1(const NR_UE_ServingCell_Info_t *servingCellInfo,
+@@ -1817,6 +1817,49 @@ static void prepare_dci_X1(const NR_UE_ServingCell_Info_t *servingCellInfo,
    }
  }
  
++/* Emit the UPER CellGroupConfig the DU sends towards a UE (inside RRCSetup or a ciphered RRCReconfiguration).
++ * nr-gnb-dci-logger saves it, so that nr-sniffer can follow that UE with a known configuration. */
++void nr_mac_trace_cellgroup(int rnti, const uint8_t *buf, int len)
++{
++  T(T_GNB_MAC_CELLGROUP, T_INT(rnti), T_BUFFER(buf, len));
++}
++
 +/* Emit one GNB_MAC_DCI T-tracer event for a DCI that has just been filled for cell->frame.cell->slot.
 + * This is the gNB ground truth that nr-sniffer's DCI log is compared against. */
 +void nr_mac_trace_dci(const nr_cell_sched_t *cell,
@@ -720,6 +778,26 @@ index 93a6372..f2a040a 100644
  void fill_dci_pdu_rel15(const NR_UE_ServingCell_Info_t *servingCellInfo,
                          const NR_UE_DL_BWP_t *current_DL_BWP,
                          const NR_UE_UL_BWP_t *current_UL_BWP,
+@@ -4065,8 +4108,10 @@ void send_initial_ul_rrc_message(int rnti, const uint8_t *sdu, sdu_size_t sdu_le
+ 
+   uint8_t du2cu[1024];
+   int encoded_len = 0;
+-  if (UE->CellGroup)
++  if (UE->CellGroup) {
+     encoded_len = encode_cellGroupConfig(UE->CellGroup, du2cu, sizeof(du2cu));
++    nr_mac_trace_cellgroup(rnti, du2cu, encoded_len);
++  }
+ 
+   DevAssert(mac->f1_config.setup_req != NULL);
+   AssertFatal(mac->f1_config.setup_req->num_cells_available == 1, "can handle only one cell\n");
+@@ -4285,6 +4330,7 @@ void nr_mac_trigger_reconfiguration(const gNB_MAC_INST *nrmac, nr_cell_sched_t *
+     .cellGroupConfig = buf,
+     .cellGroupConfig_length = (enc_rval.encoded + 7) >> 3,
+   };
++  nr_mac_trace_cellgroup(UE->rnti, buf, du2cu.cellGroupConfig_length);
+   f1_ue_data_t ue_data = du_get_f1_ue_data(UE->rnti);
+   f1ap_ue_context_modif_required_t required = {
+     .gNB_CU_ue_id = ue_data.secondary_ue,
 diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
 index fe68219..8978a3a 100644
 --- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
@@ -745,13 +823,15 @@ index fe68219..8978a3a 100644
  
  /* Slots elapsed since the UE was last scheduled in UL. */
 diff --git a/openair2/LAYER2/NR_MAC_gNB/mac_proto.h b/openair2/LAYER2/NR_MAC_gNB/mac_proto.h
-index 86bb9ca..8b9f7a8 100644
+index 86bb9ca..c88e3be 100644
 --- a/openair2/LAYER2/NR_MAC_gNB/mac_proto.h
 +++ b/openair2/LAYER2/NR_MAC_gNB/mac_proto.h
-@@ -270,6 +270,19 @@ void fill_dci_pdu_rel15(const NR_UE_ServingCell_Info_t *servingCellInfo,
+@@ -270,6 +270,21 @@ void fill_dci_pdu_rel15(const NR_UE_ServingCell_Info_t *servingCellInfo,
                          long pdsch_HARQ_ACK_Codebook,
                          uint16_t cset0_bwp_size);
  
++void nr_mac_trace_cellgroup(int rnti, const uint8_t *buf, int len);
++
 +void nr_mac_trace_dci(const nr_cell_sched_t *cell,
 +                      const nfapi_nr_dl_dci_pdu_t *dci_pdu,
 +                      const dci_pdu_rel15_t *dci,
@@ -768,6 +848,26 @@ index 86bb9ca..8b9f7a8 100644
  void set_r_pucch_parms(int rsetindex,
                         int r_pucch,
                         int bwp_size,
+diff --git a/openair2/LAYER2/NR_MAC_gNB/mac_rrc_dl_handler.c b/openair2/LAYER2/NR_MAC_gNB/mac_rrc_dl_handler.c
+index 7c03dd3..826f497 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/mac_rrc_dl_handler.c
++++ b/openair2/LAYER2/NR_MAC_gNB/mac_rrc_dl_handler.c
+@@ -771,6 +771,7 @@ void ue_context_setup_request(const f1ap_ue_context_setup_req_t *req)
+   }
+ 
+   resp.du_to_cu_rrc_info.cell_group_config = encode_cellgroup_config(new_CellGroup);
++  nr_mac_trace_cellgroup(UE->rnti, resp.du_to_cu_rrc_info.cell_group_config.buf, resp.du_to_cu_rrc_info.cell_group_config.len);
+ 
+   ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, UE->reconfigCellGroup);
+   UE->reconfigCellGroup = new_CellGroup;
+@@ -907,6 +908,7 @@ void ue_context_modification_request(const f1ap_ue_context_mod_req_t *req)
+      * CU will forward these encoded bytes directly to UE without decode/re-encode cycles */
+     resp.du_to_cu_rrc_info = calloc_or_fail(1, sizeof(du_to_cu_rrc_information_t));
+     resp.du_to_cu_rrc_info->cell_group_config = encode_cellgroup_config(new_CellGroup);
++    nr_mac_trace_cellgroup(UE->rnti, resp.du_to_cu_rrc_info->cell_group_config.buf, resp.du_to_cu_rrc_info->cell_group_config.len);
+ 
+     // Replace reconfigCellGroup with new_CellGroup (now contains complete config with spCellConfig restored)
+     ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, UE->reconfigCellGroup);
 diff --git a/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h b/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
 index f7054f7..1d0b3de 100644
 --- a/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
@@ -783,6 +883,59 @@ index f7054f7..1d0b3de 100644
    /// Slots of UL inactivity before an autonomous UL grant is issued to a UE
    uint32_t ulsch_max_frame_inactivity;
  
+diff --git a/openair2/RRC/NR_UE/L2_interface_ue.c b/openair2/RRC/NR_UE/L2_interface_ue.c
+index 7a426fb..2935d38 100644
+--- a/openair2/RRC/NR_UE/L2_interface_ue.c
++++ b/openair2/RRC/NR_UE/L2_interface_ue.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "L2_interface_ue.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ #include "assertions.h"
+ #include "LAYER2/NR_MAC_COMMON/nr_mac.h"
+ #include "openair2/LAYER2/NR_MAC_UE/mac_proto.h"
+@@ -136,6 +137,14 @@ void process_msg_rcc_to_mac(nr_mac_rrc_message_t *msg, int instance_id)
+       bool can_start_ra = msg->payload.config_sib1.can_start_ra;
+       nr_rrc_mac_config_req_sib1(instance_id, 0, sib1, can_start_ra);
+       SEQUENCE_free(&asn_DEF_NR_SIB1, msg->payload.config_sib1.sib1, ASFM_FREE_EVERYTHING);
++      // nr-sniffer: follow a UE whose configuration is known, as soon as the cell is configured
++      uint16_t known_rnti = 0;
++      NR_CellGroupConfig_t *known_cg = nr_sniffer_hook_known_ue(&known_rnti);
++      if (known_cg) {
++        nr_rrc_mac_config_req_cg(instance_id, 0, 0, 0, known_cg, NULL);
++        ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, known_cg);
++        nr_ue_mac_follow_rnti(instance_id, known_rnti);
++      }
+     } break;
+     case NR_MAC_RRC_CONFIG_OTHER_SIB: {
+       nr_rrc_mac_config_other_sib(instance_id,
+diff --git a/openair2/RRC/NR_UE/main_ue.c b/openair2/RRC/NR_UE/main_ue.c
+index baaeb7a..a66cb77 100644
+--- a/openair2/RRC/NR_UE/main_ue.c
++++ b/openair2/RRC/NR_UE/main_ue.c
+@@ -10,6 +10,7 @@
+ #include "rrc_proto.h"
+ #include "common/utils/LOG/log.h"
+ #include "executables/softmodem-common.h"
++#include "common/utils/nr_sniffer_hooks.h"
+ 
+ void init_nsa_message(NR_UE_RRC_INST_t *rrc, char* reconfig_file, char* rbconfig_file)
+ {
+@@ -38,8 +39,11 @@ void init_nsa_message(NR_UE_RRC_INST_t *rrc, char* reconfig_file, char* rbconfig
+     msg_len = fread(buffer, 1, 1024, fd);
+     fclose(fd);
+     process_nsa_message(rrc, nr_RadioBearerConfigX_r15, buffer,msg_len);
+-    MessageDef* ittiMsg = itti_alloc_new_message(TASK_RRC_NRUE, rrc->ue_id, NAS_INIT_NOS1_IF);
+-    itti_send_msg_to_task(TASK_NAS_NRUE, rrc->ue_id, ittiMsg);
++    // nr-sniffer: a passive sniffer carries no user plane, and its TUN interface would take the real UE's name
++    if (!nr_sniffer_passive()) {
++      MessageDef* ittiMsg = itti_alloc_new_message(TASK_RRC_NRUE, rrc->ue_id, NAS_INIT_NOS1_IF);
++      itti_send_msg_to_task(TASK_NAS_NRUE, rrc->ue_id, ittiMsg);
++    }
+   }
+   else
+     LOG_D(NR_RRC, "In NSA mode \n");
 diff --git a/openair2/RRC/NR_UE/rrc_UE.c b/openair2/RRC/NR_UE/rrc_UE.c
 index c28bf15..7d6fc07 100644
 --- a/openair2/RRC/NR_UE/rrc_UE.c

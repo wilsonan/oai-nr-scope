@@ -22,6 +22,8 @@ oai-nr-scope/                       (this repository)
 ├── scripts/rfsim_test.sh           M1: MIB/SIB1 against an OAI gNB in RF simulator
 ├── scripts/gnb_dci_test.sh         component B: gNB DCI log against the gNB's own counters
 ├── scripts/dci_test.sh             M2: sniffer follows one UE through RA, DCIs against component B
+├── scripts/phytest_dci_test.sh     M3: known configuration in phy-test (DCI 0_1/1_1)
+├── scripts/known_ue_test.sh        M3: known configuration in SA (CellGroupConfig exported from the gNB)
 └── scripts/compare_dci.py          M2: DCI matching, miss rate, false positives, field agreement
 ```
 
@@ -36,13 +38,15 @@ deliberately small:
 | `openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c` | M2: monitor the RA search space for tracked RNTIs when not doing an own RA; pass SS/CORESET ids to the PHY |
 | `openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c` | M2: `trigger_MAC_UE_RA()` is a no-op when passive |
 | `openair1/PHY/NR_UE_TRANSPORT/dci_nr.c` | M2: a candidate is also accepted when its CRC remainder is a tracked RNTI (`nr_sniffer_match_rnti`); SS/CORESET ids go into the DCI indication |
+| `openair2/RRC/NR_UE/L2_interface_ue.c`, `openair2/LAYER2/NR_MAC_UE/config_ue.c` | M3: right after SIB1, the MAC applies a known CellGroupConfig (`nr_sniffer_known_ue`) and follows its C-RNTI (`nr_ue_mac_follow_rnti()`) |
+| `openair2/RRC/NR_UE/main_ue.c` | M3: in phy-test a passive sniffer creates no TUN interface (it would take the real UE's `oaitun_ue1`) |
 | `openair1/SCHED_NR_UE/fapi_nr_ue_l1.c` | M2: when passive, UL config (PUSCH, PUCCH, PRACH, SRS) is dropped before it reaches the PHY |
 | `nfapi/.../fapi_nr_ue_interface.h` | M2: `ss_id`/`coreset_id` in the UE DCI config and indication structs |
 | `openair2/RRC/NR_UE/rrc_UE.c` | SIB1 reported before processing; random access is not started in passive mode |
 | `executables/nr-uesoftmodem.c` | Calls `nr_sniffer_init()` so `--sniffer.*` options are registered |
 | `CMakeLists.txt` | `add_subdirectory(nr-sniffer)` if the directory exists (binary dir `nr-sniffer-build`, executable next to `nr-softmodem`) |
-| `common/utils/T/T_messages.txt` | New `GNB_MAC_DCI` T event (component B) |
-| `openair2/LAYER2/NR_MAC_gNB/*` | `nr_mac_trace_dci()` emits `GNB_MAC_DCI` after each `fill_dci_pdu_rel15()` call (SIB/OSI, paging, Msg2, Msg3 retransmission, Msg4, C-RNTI DL and UL); `nr_cell_sched_t` remembers the slot being scheduled. A no-op unless the gNB runs with `--T_stdout 0/2` |
+| `common/utils/T/T_messages.txt` | New `GNB_MAC_DCI` and `GNB_MAC_CELLGROUP` T events (component B) |
+| `openair2/LAYER2/NR_MAC_gNB/*` | `nr_mac_trace_dci()` emits `GNB_MAC_DCI` after each `fill_dci_pdu_rel15()` call (SIB/OSI, paging, Msg2, Msg3 retransmission, Msg4, C-RNTI DL and UL); `nr_cell_sched_t` remembers the slot being scheduled. `nr_mac_trace_cellgroup()` emits `GNB_MAC_CELLGROUP` wherever the DU encodes a UE's CellGroupConfig for the CU (RRCSetup, UE context setup/modification). No-ops unless the gNB runs with `--T_stdout 0/2` |
 | `radio/rfsimulator/simulator.cpp` | rfsim server falls back to IPv4 when the kernel has no IPv6 (cloud containers); not sniffer-specific |
 
 Because the hooks are weak symbols, they are NULL in every other OAI binary. `nr-uesoftmodem`
@@ -94,6 +98,40 @@ UL: fapi_nr_ue_l1.c drops all UL config when passive (no PRACH, PUSCH, PUCCH, SR
 Limits (M2): one UE, the first whose Msg4 is decoded. The sniffer must be running before that UE's
 random access. A UE that is already connected can only be followed with a known configuration (M3).
 
+## Known configuration (M3)
+
+NR-Scope's `fixed_rnti` branch follows a UE whose configuration is known. The sniffer does the same
+with `--sniffer.cellgroup_file <file> [--sniffer.rnti <C-RNTI>]`:
+
+- The file is a UPER `CellGroupConfig`, or an `RRCReconfiguration` (its `secondaryCellGroup` or
+  `masterCellGroup`), detected automatically.
+- `reconfigurationWithSync` is dropped, because in SA the cell configuration comes from SIB1. Its
+  `newUE-Identity` is used as the C-RNTI if `--sniffer.rnti` is not given.
+- When SIB1 has been applied, `L2_interface_ue.c` hands the CellGroupConfig to
+  `nr_rrc_mac_config_req_cg()`, the same MAC call RRC uses for RRCSetup. `nr_ue_mac_follow_rnti()`
+  then takes the RNTI as C-RNTI. From there on it is the M2 path. Random-access following stays
+  on, but no other UE is adopted. `ue.csv` gets a row with `contention_resolution_id` = `known`.
+
+**Where the file comes from.** On ExPECA we run the gNB, so we can export what the UE is told even
+though the RRCReconfiguration carrying it is ciphered: `nr-gnb-dci-logger -c <dir>` saves every
+CellGroupConfig the DU encodes for a UE (`GNB_MAC_CELLGROUP`), as `<dir>/cellgroup_<rnti>_<n>.uper`,
+listed in `<dir>/cellgroups.csv` (`timestamp_us,rnti,length,file`). Use the last file for the UE.
+The CellGroupConfigs are those the DU sends the CU, which forwards them unchanged inside RRCSetup or
+RRCReconfiguration (TS 38.473 transparency).
+
+**phy-test.** A phy-test gNB has no RA and no SIB1, and writes `reconfig.raw`/`rbconfig.raw` for the
+UE. `nr-sniffer --phy-test --reconfig-file reconfig.raw --rbconfig-file rbconfig.raw` uses OAI's own
+phy-test initialisation with the same files, so it is configured exactly like the UE. The phy-test
+scheduler sends DCI 1_1/0_1 in the UE-specific search space every TDD period, which is the test the
+no-core SA setup could not provide.
+
+Results in the cloud VM (`scripts/phytest_dci_test.sh`, `scripts/known_ue_test.sh`):
+
+| Test | gNB DCIs for the UE | Missed | False positives | Fields |
+|---|---|---|---|---|
+| phy-test, DCI 1_1/0_1, 15 s, three runs | 11 170 / 28 648 / 29 934 | 0 | 0 | all equal, same scheduled bits |
+| SA, sniffer started after the UE attached, known CellGroupConfig, 15 s, two runs | 421 / 403 | 0 | 0 | all equal, same scheduled bits |
+
 ## NR-Scope feature map
 
 | NR-Scope feature | OAI building block (2026.w41) | Status / work needed |
@@ -107,7 +145,7 @@ random access. A UE that is already connected can only be followed with a known 
 | DCI decoding for many UEs | `dci_nr.c: nr_dci_decoding_procedure()` checks the CRC against **one** RNTI per search-space PDU | M2: tracked-RNTI acceptance for RA/TC-RNTIs, one followed C-RNTI. M3: **main refactor**, see below |
 | DCI → PRB/MCS/TBS per UE | MAC `nr_extract_dci_info()`, `nr_ue_process_dci_indication_pdu()`; TBS via `nr_compute_tbs()` | **Done (M2)** for the followed UE, by OAI's own DCI processing (`report_dci_to_sniffer()`) |
 | 64QAM vs 256QAM MCS table | `pdsch-Config.mcs-Table` in the CellGroupConfig | Config option `--sniffer.mcs_table` (already parsed) |
-| Known RRCReconfiguration (NR-Scope `fixed_rnti`) | RRCReconfiguration is ciphered | M3: `--sniffer.cellgroup_file` loads a CellGroupConfig (UPER/XER). On ExPECA it can be exported from our own gNB |
+| Known RRCReconfiguration (NR-Scope `fixed_rnti`) | RRCReconfiguration is ciphered | **Done (M3)**: `--sniffer.cellgroup_file` + `--sniffer.rnti`, see below. Planned originally as: `--sniffer.cellgroup_file` loads a CellGroupConfig (UPER/XER). On ExPECA it can be exported from our own gNB |
 | Worker pool / circular slot buffer | nrUE already processes slots with an actor/thread pool (`executables/nr-ue.c`) | M3: give DCI search for tracked RNTIs its own actor queue so it can lag behind real time |
 | Multiple USRPs / cells | one nrUE instance per process | Run one `nr-sniffer` per radio, each with its own `out_dir` |
 | CSV logs | — | **Done**: MIB/SIB1 (M1), `dci.csv`, `rar.csv`, `ue.csv` (M2); schema below |
@@ -164,8 +202,10 @@ It turns on only `GNB_MAC_DCI` and writes `gnb_dci.csv` in the shared DCI schema
 
 ```bash
 ./nr-softmodem -O gnb.conf --rfsim ... --T_stdout 2         # waits for a tracer before starting
-./nr-gnb-dci-logger -d ../../../common/utils/T/T_messages.txt -o gnb_dci.csv
+./nr-gnb-dci-logger -d ../../../common/utils/T/T_messages.txt -o gnb_dci.csv [-c cellgroups/]
 ```
+
+`-c` also saves each UE's CellGroupConfig (see Known configuration).
 
 `scripts/gnb_dci_test.sh` runs gNB + logger + one `nr-uesoftmodem` (no core, see README) and checks
 the log against the gNB's own view. It expects SI-RNTI DCIs, the RAR DCI on the RA-RNTI and the Msg4
@@ -234,6 +274,8 @@ section of the `-O` config file. See `nr-sniffer/conf/nr-sniffer.conf`.
 | `pci` | `-1` | Only log this PCI |
 | `mcs_table` | `qam256` | MCS table assumed with a known configuration (M3). In M2 the MCS table comes from the decoded RRCSetup (`pdsch-Config.mcs-Table`) |
 | `dump_xml` | `1` | Write each new SIB1 as XER |
+| `cellgroup_file` | `""` | Follow a UE with this known UPER CellGroupConfig or RRCReconfiguration (M3) |
+| `rnti` | `-1` | C-RNTI of the UE in `cellgroup_file`; `-1` takes it from `reconfigurationWithSync` |
 | `follow_ue` | `1` | Follow the first UE seen in random access and log its DCIs; `0` is M1 behaviour (MIB/SIB1 only) |
 
 Tuning uses the standard nrUE options: `-C <DL centre Hz> -r <PRBs> --numerology <mu> --band <n> [--ssb <start subcarrier>]`.
@@ -245,15 +287,17 @@ cloud VM, three runs of 10-20 s. The sniffer decoded the UE's RAR and Msg4 and f
 0 of the 298 / 554 / 575 gNB DCIs for the UE, had 0 false positives, and summed exactly the same
 scheduled bits as the gNB. All 15 compared fields were equal except, in one run, one `ss_id` (below).
 
-- **Only DCI 0_0/1_0 are tested.** Without a core, the gNB never sends RRCReconfiguration, so it keeps
-  the UE on common search space 4 (CORESET 0). Search space 5 with DCI 0_1/1_1 is in the RRCSetup, and
-  the sniffer monitors it, but the gNB moves the UE there only after RRCReconfigurationComplete. The
-  0_1/1_1 path (`report_dci_to_sniffer()` in `nr_ue_process_dci_dl_11/ul_01`) still needs a run with
-  a core (ExPECA) or with a known configuration (M3).
+- **In SA, only DCI 0_0/1_0 are tested.** Without a core, the gNB never sends RRCReconfiguration, so
+  it keeps the UE on common search space 4 (CORESET 0). Search space 5 with DCI 0_1/1_1 is in the
+  RRCSetup, and the sniffer monitors it, but the gNB moves the UE there only after
+  RRCReconfigurationComplete. DCI 0_1/1_1 decoding is tested in phy-test instead (known
+  configuration, above).
 - **RRCReconfiguration** (ciphered once a core is attached) can change the DCI 0_1/1_1 sizes, for
-  example through antenna ports or the CSI request field. The sniffer keeps the RRCSetup
-  configuration, so with a core it may lose the UE after reconfiguration until M3's
-  `cellgroup_file` gives it the reconfigured CellGroupConfig.
+  example through antenna ports or the CSI request field. A sniffer that followed the UE through
+  RA keeps the RRCSetup configuration, so with a core it may lose the UE after reconfiguration.
+  The fix is to start it with the reconfigured CellGroupConfig (`--sniffer.cellgroup_file`, exported
+  by `nr-gnb-dci-logger -c`). Switching from the RRCSetup to the reconfigured configuration on the
+  fly is not implemented yet.
 - **Search-space attribution:** right after Msg4 the gNB can already use SS 4, which the RRCSetup
   defines, while the sniffer's RRC has not yet applied the RRCSetup. The sniffer then finds the same PDCCH candidate (same
   CORESET 0 CCEs) through its fallback CSS 1 and logs `ss_id` 1. The DCI itself is identical.
