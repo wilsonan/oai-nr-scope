@@ -16,6 +16,7 @@ add_executable(nr-sniffer
   ${PHY_INTERFACE_DIR}/queue_t.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_csv.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_dci.c
 )
 
 target_include_directories(nr-sniffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -42,4 +43,14 @@ if (${T_TRACER})
 endif()
 
 # Build the sniffer together with the radio/runtime modules it loads.
-add_custom_target(nr-sniffer-all DEPENDS nr-sniffer params_libconfig coding rfsimulator dfts)
+add_custom_target(nr-sniffer-all DEPENDS nr-sniffer nr-gnb-dci-logger params_libconfig coding rfsimulator dfts)
+
+# Component B: gNB ground-truth DCI logger (T-tracer client, GNB_MAC_DCI events)
+add_executable(nr-gnb-dci-logger
+  ${CMAKE_CURRENT_SOURCE_DIR}/tracer/nr_gnb_dci_logger.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_dci.c
+)
+target_include_directories(nr-gnb-dci-logger PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${OPENAIR_DIR}/common/utils/T/tracer)
+target_link_libraries(nr-gnb-dci-logger PRIVATE tracer_utils asn1_nr_rrc_hdrs)
+set_target_properties(nr-gnb-dci-logger PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

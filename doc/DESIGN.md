@@ -16,8 +16,11 @@ oai-nr-scope/                       (this repository)
 ├── oai-patches/0001-*.patch        small hook patch applied to OAI
 ├── nr-sniffer/                     sniffer sources, linked into the OAI tree
 ├── scripts/setup_oai.sh            clone OAI at OAI_VERSION, apply patches, link nr-sniffer
-├── scripts/build.sh                build nr-sniffer + gNB + UE + rfsim
-└── scripts/rfsim_test.sh           end-to-end test against an OAI gNB in RF simulator
+├── nr-sniffer/tracer/              nr-gnb-dci-logger, the gNB ground-truth T-tracer client
+├── scripts/build.sh                build nr-sniffer + nr-gnb-dci-logger + gNB + UE + rfsim
+├── scripts/rfsim_common.sh         shared gNB/UE/sniffer start-up for the rfsim tests
+├── scripts/rfsim_test.sh           M1: MIB/SIB1 against an OAI gNB in RF simulator
+└── scripts/gnb_dci_test.sh         component B: gNB DCI log against the gNB's own counters
 ```
 
 `nr-sniffer` is a separate executable. It is compiled from the same sources as `nr-uesoftmodem`
@@ -31,6 +34,8 @@ deliberately small:
 | `openair2/RRC/NR_UE/rrc_UE.c` | SIB1 reported before processing; random access is not started in passive mode |
 | `executables/nr-uesoftmodem.c` | Calls `nr_sniffer_init()` so `--sniffer.*` options are registered |
 | `CMakeLists.txt` | `add_subdirectory(nr-sniffer)` if the directory exists (binary dir `nr-sniffer-build`, executable next to `nr-softmodem`) |
+| `common/utils/T/T_messages.txt` | New `GNB_MAC_DCI` T event (component B) |
+| `openair2/LAYER2/NR_MAC_gNB/*` | `nr_mac_trace_dci()` emits `GNB_MAC_DCI` after each `fill_dci_pdu_rel15()` call (SIB/OSI, paging, Msg2, Msg3 retransmission, Msg4, C-RNTI DL and UL); `nr_cell_sched_t` remembers the slot being scheduled. A no-op unless the gNB runs with `--T_stdout 0/2` |
 | `radio/rfsimulator/simulator.cpp` | rfsim server falls back to IPv4 when the kernel has no IPv6 (cloud containers); not sniffer-specific |
 
 Because the hooks are weak symbols, they are NULL in every other OAI binary. `nr-uesoftmodem`
@@ -98,11 +103,36 @@ enough for 100 MHz cells.
 
 ## Ground truth from the gNB (component B)
 
-OAI's T-tracer (`common/utils/T`) already emits `GNB_MAC_DL_PDU_WITH_DATA`,
-`GNB_MAC_UL_PDU_WITH_DATA`, `GNB_MAC_DL_RAR_PDU_WITH_DATA` and related events. A small T-tracer
-client (`nr-sniffer/tools/gnb_truth`, M2) writes these into the same CSV schema. If a needed field
-(for example CCE index or aggregation level) is not traced, add one T event in
-`openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.c` / the DCI fill functions.
+OAI's T-tracer (`common/utils/T`) already emits `GNB_MAC_DL`/`GNB_MAC_UL` (rnti, frame, slot,
+MCS, TBS) and the MAC PDU events. None of them has the DCI format, aggregation level, CCE, PRBs,
+NDI, RV or HARQ process, so the patch adds one event:
+
+```
+GNB_MAC_DCI: frame, slot, rnti, rnti_type, dci_format, bwp_id, coreset_id, ss_id, aggregation_level,
+             cce_index, prb_start, prb_len, mcs, mcs_table, tbs_bits, ndi, rv, harq_pid
+```
+
+It is emitted by `nr_mac_trace_dci()` (`gNB_scheduler_primitives.c`) right after each
+`fill_dci_pdu_rel15()` call, so it carries exactly what goes into the DCI payload, plus the PRBs,
+MCS table and TBS of the PDSCH/PUSCH PDU it schedules. `frame`/`slot` are the PDCCH slot (what the
+sniffer sees), not the PDSCH/PUSCH slot. `prb_start` is relative to the BWP start. `rnti_type`
+and `dci_format` are OAI's `nr_rnti_type_t` / `nr_dci_format_t`. The phy-test scheduler is not
+instrumented.
+
+`nr-gnb-dci-logger` (`nr-sniffer/tracer/`) is a T-tracer client modelled on OAI's `tracer/csv.c`.
+It turns on only `GNB_MAC_DCI` and writes `gnb_dci.csv` in the shared DCI schema with
+`source=gnb`. `nr_sniffer_dci.c`, which also builds into nr-sniffer, defines that schema. Usage:
+
+```bash
+./nr-softmodem -O gnb.conf --rfsim ... --T_stdout 2         # waits for a tracer before starting
+./nr-gnb-dci-logger -d ../../../common/utils/T/T_messages.txt -o gnb_dci.csv
+```
+
+`scripts/gnb_dci_test.sh` runs gNB + logger + one `nr-uesoftmodem` (no core, see README) and checks
+the log against the gNB's own view. It expects SI-RNTI DCIs, the RAR DCI on the RA-RNTI and the Msg4
+DCI on the TC-RNTI that the gNB logs for the RA procedure. Per-UE DL and UL DCI counts must equal
+the `dlsch_rounds`/`ulsch_rounds` totals the gNB prints, with a small allowance for DCIs sent after
+its last statistics print. In the cloud runs they matched exactly (e.g. 83 DL / 791 UL).
 
 ## Output schemas
 
@@ -124,7 +154,11 @@ ssb_positions_in_burst,ssb_periodicity_ms,ss_pbch_block_power_dbm,tdd_ref_scs_kh
 tdd_dl_slots,tdd_dl_symbols,tdd_ul_slots,tdd_ul_symbols,si_scheduling_present,nb_sib1_decoded
 ```
 
-`dci.csv` (M2, shared with the gNB ground-truth logger):
+`dci.csv` (M2) and `gnb_dci.csv` (component B) share one schema (`nr-sniffer/src/nr_sniffer_dci.h`).
+`rnti` is hex, `rnti_type` is one of `c,cs,tc,p,si,ra,msgb,mcs-c`, `dci_format` is e.g. `1_0`,
+`direction` is `dl`/`ul`, `mcs_table` is `qam64,qam256,qam64LowSE,tp-qam64,tp-qam64LowSE`,
+`prb_start` is relative to the BWP, `tbs_bits` is the transport block size, and `source` is
+`sniffer` or `gnb`:
 
 ```
 timestamp_us,sfn,slot,rnti,rnti_type,dci_format,direction,bwp_id,coreset_id,ss_id,aggregation_level,

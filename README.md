@@ -17,7 +17,9 @@ random-access attempt.
 - [x] `scripts/rfsim_test.sh` + `scripts/check_cell.py`: gNB-in-rfsim end-to-end check
 - [x] Compile `nr-sniffer` and fix any build errors
 - [x] Run `scripts/rfsim_test.sh` until it prints `RESULT: PASS`
-- [ ] Stretch: T-tracer ground-truth logger
+- [x] Stretch: T-tracer ground-truth logger (`nr-gnb-dci-logger`, `scripts/gnb_dci_test.sh` passes)
+
+Milestone 2 (RACH/Msg4 tracking + DCI decoding for one UE) is in progress.
 
 ## Quick start
 
@@ -26,6 +28,7 @@ scripts/setup_oai.sh                    # clones OAI 2026.w41 into ./oai, applie
 (cd oai/cmake_targets && ./build_oai -I) # OAI build dependencies (once)
 scripts/build.sh                        # nr-sniffer, nr-softmodem, nr-uesoftmodem, rfsimulator
 scripts/rfsim_test.sh                   # gNB (rfsim) + sniffer, checks MIB/SIB1 against the gNB config
+scripts/gnb_dci_test.sh                 # gNB (rfsim, T-tracer) + nr-gnb-dci-logger + one UE
 ```
 
 Running the sniffer against a cell:
@@ -42,8 +45,10 @@ No core network or code change is needed for SIB1. The OAI gNB starts its cell a
 F1 Setup between its CU and DU, which does not depend on NG Setup with an AMF. MIB and SIB1 are
 broadcast while NGAP keeps retrying in the background. `scripts/rfsim_test.sh` only rewrites the
 AMF and NG/NGU addresses in a copy of the config to `127.0.0.1`, so the gNB starts cleanly
-without the `192.168.71.x` interfaces from OAI's docker setup. A UE could not register without
-a core, but the sniffer never tries.
+without the `192.168.71.x` interfaces from OAI's docker setup. Without a core, an `nr-uesoftmodem` still completes RA, gets RRCSetup in Msg4 and reaches
+RRC_CONNECTED (`RRCSetupComplete` is received). NAS registration then goes nowhere, so there is
+no RRCReconfiguration or security. The gNB keeps scheduling the UE with DCI 0_0/1_0 on its C-RNTI,
+mostly periodic UL grants and some DL. That is enough for component B and milestone 2.
 
 ### Passivity check
 
@@ -59,6 +64,17 @@ The cloud container's kernel has no IPv6 (`socket(AF_INET6)` fails with `EAFNOSU
 rfsim server binds IPv6 only, so the gNB aborted with `could not open a socket`. The OAI patch
 adds an IPv4 fallback to `startServer()` in `radio/rfsimulator/simulator.cpp`. The rfsim client
 already uses `AF_UNSPEC`.
+
+## gNB ground truth (component B)
+
+```bash
+./nr-softmodem -O gnb.conf --rfsim ... --T_stdout 2   # T-tracer on; waits for a tracer to connect
+./nr-gnb-dci-logger -d ../../../common/utils/T/T_messages.txt -o gnb_dci.csv
+```
+
+The OAI patch adds a `GNB_MAC_DCI` T event (see [doc/DESIGN.md](doc/DESIGN.md)). It is free when
+the T-tracer is off, which is the default. On ExPECA it works the same way with the real gNB, so
+the logger can run on the gNB host or anywhere that reaches its T port (`-ip`, `-p`).
 
 ## Building in a restricted cloud VM
 

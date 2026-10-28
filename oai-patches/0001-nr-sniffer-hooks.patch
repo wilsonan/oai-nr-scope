@@ -11,6 +11,21 @@ index 5e58be3..a89d739 100644
 +if(EXISTS ${OPENAIR_DIR}/nr-sniffer/CMakeLists.txt)
 +  add_subdirectory(${OPENAIR_DIR}/nr-sniffer ${CMAKE_BINARY_DIR}/nr-sniffer-build)
 +endif()
+diff --git a/common/utils/T/T_messages.txt b/common/utils/T/T_messages.txt
+index 954017a..887a2ee 100644
+--- a/common/utils/T/T_messages.txt
++++ b/common/utils/T/T_messages.txt
+@@ -265,6 +265,10 @@ ID = GNB_MAC_LCID_UL
+     DESC = NR MAC uplink traffic received for an UE for a specific LCID
+     GROUP = ALL:MAC:GNB
+     FORMAT = int,rnti : int,frame : int,slot : int,lcid : int,data_size
++ID = GNB_MAC_DCI
++    DESC = NR MAC DCI sent on PDCCH in frame.slot, with the PDSCH/PUSCH it schedules (prb_start relative to the BWP, tbs in bits)
++    GROUP = ALL:MAC:GNB
++    FORMAT = int,frame : int,slot : int,rnti : int,rnti_type : int,dci_format : int,bwp_id : int,coreset_id : int,ss_id : int,aggregation_level : int,cce_index : int,prb_start : int,prb_len : int,mcs : int,mcs_table : int,tbs_bits : int,ndi : int,rv : int,harq_pid
+ 
+ #RLC logs
+ ID = ENB_RLC_DL
 diff --git a/common/utils/nr_sniffer_hooks.h b/common/utils/nr_sniffer_hooks.h
 new file mode 100644
 index 0000000..17f5cd2
@@ -149,6 +164,240 @@ index d7d1031..c08f7c1 100644
  }
  
  static void configure_ratematching_csi(fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_pdu,
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c
+index 3a52e52..46e8c5e 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler.c
+@@ -147,6 +147,8 @@ void gNB_dlsch_ulsch_scheduler(module_id_t module_idP, const int cell_id, frame_
+   clear_beam_information(&cell->beam_info, frame, slot, slots_frame);
+ 
+   gNB->frame = frame;
++  cell->frame = frame;
++  cell->slot = slot;
+   start_meas(&cell->gNB_scheduler);
+ 
+   int num_beams = 1;
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c
+index 6910556..269c2e7 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c
+@@ -1025,6 +1025,18 @@ static void nr_generate_Msg3_retransmission(nr_cell_sched_t *cell,
+                      coreset,
+                      0, // parameter not needed for DCI 0_0
+                      cell->cset0_bwp_size);
++  nr_mac_trace_dci(cell,
++                   dci_pdu,
++                   &uldci_payload,
++                   NR_UL_DCI_FORMAT_0_0,
++                   TYPE_TC_RNTI_,
++                   ul_bwp->bwp_id,
++                   ss,
++                   coreset,
++                   pusch_pdu->rb_start,
++                   pusch_pdu->rb_size,
++                   pusch_pdu->mcs_table,
++                   pusch_pdu->pusch_data.tb_size);
+ 
+   // Mark the corresponding RBs as used
+   fill_pdcch_vrb_map(cell,
+@@ -1572,6 +1584,18 @@ static void prepare_dl_pdus(nr_cell_sched_t *cell,
+                      coreset,
+                      0, // parameter not needed for DCI 1_0
+                      cell->cset0_bwp_size);
++  nr_mac_trace_dci(cell,
++                   dci_pdu,
++                   &dci_payload,
++                   NR_DL_DCI_FORMAT_1_0,
++                   rnti_type,
++                   dl_bwp->bwp_id,
++                   sched_ctrl->search_space,
++                   coreset,
++                   pdsch_pdu_rel15->rbStart,
++                   pdsch_pdu_rel15->rbSize,
++                   pdsch_pdu_rel15->mcsTable[0],
++                   pdsch_pdu_rel15->TBSize[0]);
+ 
+   LOG_D(NR_MAC, "BWPSize: %i\n", pdcch_pdu_rel15->BWPSize);
+   LOG_D(NR_MAC, "BWPStart: %i\n", pdcch_pdu_rel15->BWPStart);
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_bch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_bch.c
+index a5e8e9a..ec598b9 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_bch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_bch.c
+@@ -331,6 +331,18 @@ static void nr_fill_nfapi_dl_SIB_pdu( nr_cell_sched_t *cell,
+                      coreset,
+                      0,
+                      cell->cset0_bwp_size);
++  nr_mac_trace_dci(cell,
++                   dci_pdu,
++                   &dci_payload,
++                   dci_format,
++                   rnti_type,
++                   0,
++                   search_space,
++                   coreset,
++                   pdsch_pdu_rel15->rbStart,
++                   pdsch_pdu_rel15->rbSize,
++                   pdsch_pdu_rel15->mcsTable[0],
++                   pdsch_pdu_rel15->TBSize[0]);
+ 
+   LOG_D(MAC,
+         "BWPSize: %3i, BWPStart: %3i, SubcarrierSpacing: %i, CyclicPrefix: %i, StartSymbolIndex: %i, DurationSymbols: %i, "
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+index 7589603..8731423 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+@@ -1376,6 +1376,18 @@ void post_process_dlsch(gNB_MAC_INST *nr_mac,
+                      sched_ctrl->coreset,
+                      UE->pdsch_HARQ_ACK_Codebook,
+                      cell->cset0_bwp_size);
++  nr_mac_trace_dci(cell,
++                   dci_pdu,
++                   &dci_payload,
++                   current_BWP->dci_format,
++                   rnti_type,
++                   current_BWP->bwp_id,
++                   sched_ctrl->search_space,
++                   sched_ctrl->coreset,
++                   pdsch_pdu->rbStart,
++                   pdsch_pdu->rbSize,
++                   pdsch_pdu->mcsTable[0],
++                   pdsch_pdu->TBSize[0]);
+ 
+   LOG_D(NR_MAC,
+         "coreset params: FreqDomainResource %llx, start_symbol %d  n_symb %d\n",
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_pcch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_pcch.c
+index 1e1ec50..707ad04 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_pcch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_pcch.c
+@@ -204,6 +204,18 @@ static void nr_fill_nfapi_dl_PCCH_pdu(nr_cell_sched_t *cell,
+                      coreset,
+                      0,
+                      cell->cset0_bwp_size);
++  nr_mac_trace_dci(cell,
++                   dci_pdu,
++                   &dci_payload,
++                   dci_format,
++                   rnti_type,
++                   0,
++                   search_space,
++                   coreset,
++                   pdsch_pdu_rel15->rbStart,
++                   pdsch_pdu_rel15->rbSize,
++                   pdsch_pdu_rel15->mcsTable[0],
++                   pdsch_pdu_rel15->TBSize[0]);
+ }
+ 
+ /** @brief Returns true if (frame, slot) is a paging occasion (PO) for a given UE.
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
+index 93a6372..f2a040a 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_primitives.c
+@@ -1817,6 +1817,42 @@ static void prepare_dci_X1(const NR_UE_ServingCell_Info_t *servingCellInfo,
+   }
+ }
+ 
++/* Emit one GNB_MAC_DCI T-tracer event for a DCI that has just been filled for cell->frame.cell->slot.
++ * This is the gNB ground truth that nr-sniffer's DCI log is compared against. */
++void nr_mac_trace_dci(const nr_cell_sched_t *cell,
++                      const nfapi_nr_dl_dci_pdu_t *dci_pdu,
++                      const dci_pdu_rel15_t *dci,
++                      int dci_format,
++                      int rnti_type,
++                      int bwp_id,
++                      const NR_SearchSpace_t *ss,
++                      const NR_ControlResourceSet_t *coreset,
++                      int prb_start,
++                      int prb_len,
++                      int mcs_table,
++                      int tbs_bytes)
++{
++  T(T_GNB_MAC_DCI,
++    T_INT(cell->frame),
++    T_INT(cell->slot),
++    T_INT(dci_pdu->RNTI),
++    T_INT(rnti_type),
++    T_INT(dci_format),
++    T_INT(bwp_id),
++    T_INT(coreset->controlResourceSetId),
++    T_INT(ss->searchSpaceId),
++    T_INT(dci_pdu->AggregationLevel),
++    T_INT(dci_pdu->CceIndex),
++    T_INT(prb_start),
++    T_INT(prb_len),
++    T_INT(dci->mcs),
++    T_INT(mcs_table),
++    T_INT(tbs_bytes * 8),
++    T_INT(dci->ndi),
++    T_INT(dci->rv),
++    T_INT(dci->harq_pid.val));
++}
++
+ void fill_dci_pdu_rel15(const NR_UE_ServingCell_Info_t *servingCellInfo,
+                         const NR_UE_DL_BWP_t *current_DL_BWP,
+                         const NR_UE_UL_BWP_t *current_UL_BWP,
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+index fe68219..8978a3a 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+@@ -2598,7 +2598,18 @@ void post_process_ulsch(gNB_MAC_INST *nr_mac,
+                      coreset,
+                      UE->pdsch_HARQ_ACK_Codebook,
+                      cell->cset0_bwp_size);
+-
++  nr_mac_trace_dci(cell,
++                   dci_pdu,
++                   &uldci_payload,
++                   current_BWP->dci_format,
++                   TYPE_C_RNTI_,
++                   current_BWP->bwp_id,
++                   ss,
++                   coreset,
++                   pusch_pdu->rb_start,
++                   pusch_pdu->rb_size,
++                   pusch_pdu->mcs_table,
++                   pusch_pdu->pusch_data.tb_size);
+ }
+ 
+ /* Slots elapsed since the UE was last scheduled in UL. */
+diff --git a/openair2/LAYER2/NR_MAC_gNB/mac_proto.h b/openair2/LAYER2/NR_MAC_gNB/mac_proto.h
+index 86bb9ca..8b9f7a8 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/mac_proto.h
++++ b/openair2/LAYER2/NR_MAC_gNB/mac_proto.h
+@@ -270,6 +270,19 @@ void fill_dci_pdu_rel15(const NR_UE_ServingCell_Info_t *servingCellInfo,
+                         long pdsch_HARQ_ACK_Codebook,
+                         uint16_t cset0_bwp_size);
+ 
++void nr_mac_trace_dci(const nr_cell_sched_t *cell,
++                      const nfapi_nr_dl_dci_pdu_t *dci_pdu,
++                      const dci_pdu_rel15_t *dci,
++                      int dci_format,
++                      int rnti_type,
++                      int bwp_id,
++                      const NR_SearchSpace_t *ss,
++                      const NR_ControlResourceSet_t *coreset,
++                      int prb_start,
++                      int prb_len,
++                      int mcs_table,
++                      int tbs_bytes);
++
+ void set_r_pucch_parms(int rsetindex,
+                        int r_pucch,
+                        int bwp_size,
+diff --git a/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h b/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
+index f7054f7..1d0b3de 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
++++ b/openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
+@@ -1265,6 +1265,10 @@ typedef struct nr_cell_sched_s {
+   /// TDD/FDD frame structure (slot patterns, numerology)
+   frame_structure_t frame_structure;
+ 
++  /// Frame and slot currently being scheduled (the slot the DCIs are sent in)
++  frame_t frame;
++  slot_t slot;
++
+   /// Slots of UL inactivity before an autonomous UL grant is issued to a UE
+   uint32_t ulsch_max_frame_inactivity;
+ 
 diff --git a/openair2/RRC/NR_UE/rrc_UE.c b/openair2/RRC/NR_UE/rrc_UE.c
 index c28bf15..7d6fc07 100644
 --- a/openair2/RRC/NR_UE/rrc_UE.c
