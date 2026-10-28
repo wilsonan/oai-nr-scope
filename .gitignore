@@ -4,3 +4,4 @@ gnb-dci-test-out/
 dci-test-out/
 phytest-dci-test-out/
 known-ue-test-out/
+__pycache__/
