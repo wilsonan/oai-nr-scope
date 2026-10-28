@@ -30,10 +30,12 @@ deliberately small:
 | `openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c` | `nr_ue_decode_mib()` reports the decoded MIB plus PCI/SSB index |
 | `openair2/RRC/NR_UE/rrc_UE.c` | SIB1 reported before processing; random access is not started in passive mode |
 | `executables/nr-uesoftmodem.c` | Calls `nr_sniffer_init()` so `--sniffer.*` options are registered |
-| `CMakeLists.txt` | `add_subdirectory(nr-sniffer)` if the directory exists |
+| `CMakeLists.txt` | `add_subdirectory(nr-sniffer)` if the directory exists (binary dir `nr-sniffer-build`, executable next to `nr-softmodem`) |
+| `radio/rfsimulator/simulator.cpp` | rfsim server falls back to IPv4 when the kernel has no IPv6 (cloud containers); not sniffer-specific |
 
 Because the hooks are weak symbols, they are NULL in every other OAI binary. `nr-uesoftmodem`
-and `nr-softmodem` behave exactly as before, so the patch could be upstreamed.
+and `nr-softmodem` behave exactly as before (apart from the rfsim IPv4 fallback, which only
+changes anything on hosts where the IPv6 bind used to fail), so the patch could be upstreamed.
 
 ## Data flow (milestone 1)
 

@@ -105,6 +105,7 @@ void nr_sniffer_init(configmodule_interface_t *cfg)
 
   printf("[SNIFFER] nr-sniffer started: out_dir=%s passive=%d pci=%d mcs_table=%s\n",
          S.out_dir, S.passive, S.pci_filter, S.mcs_table);
+  fflush(stdout); /* [SNIFFER] lines are followed live through a pipe or file */
   S.initialized = true;
   pthread_mutex_unlock(&S.lock);
 }
@@ -157,6 +158,7 @@ void nr_sniffer_on_mib(const nr_sniffer_mib_t *mib)
              "CORESET0 %d, SearchSpace0 %d, %s\n",
              mib->pci, mib->sfn, mib->ssb_index, scs, mib->ssb_subcarrier_offset, mib->coreset0, mib->searchspace0,
              mib->cell_barred == 0 ? "barred" : "not barred");
+      fflush(stdout);
     }
   }
   pthread_mutex_unlock(&S.lock);
@@ -294,21 +296,29 @@ void nr_sniffer_on_sib1(const void *sib1_ptr, int frame, int slot)
 
   char row[1024];
   snprintf(row, sizeof(row),
-           "%d,%d,%d,%ld,0x%09lx,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,"
-           "%s,%ld,%ld,%ld,%s,%ld,%ld,%ld,%ld,%d",
+           /* pci..cell_reserved, band..loc_bw, initial BWP, search spaces, RACH, SSB, TDD, si_scheduling */
+           "%d,%d,%d,%ld,0x%09lx,%ld,"
+           "%ld,%ld,%ld,%ld,%ld,%ld,"
+           "%d,%d,%ld,"
+           "%ld,%ld,%ld,%ld,"
+           "%ld,%ld,%ld,%ld,"
+           "%s,%ld,%ld,"
+           "%ld,%s,%ld,%ld,%ld,%ld,"
+           "%d",
            pci, mcc, mnc, tac, (unsigned long)nci, cell_reserved, band,
            offset_to_point_a, scs, carrier_bw, offset_to_carrier, loc_bw, bwp_start, bwp_size, bwp_scs, ss_sib1, ra_ss,
            paging_ss, nb_css, prach_idx, msg1_fdm, msg1_fstart, ra_win, ssb_pos, ssb_period, ss_pbch_power,
            tdd_ref_scs, tdd_period, tdd_dl_slots, tdd_dl_sym, tdd_ul_slots, tdd_ul_sym, sib1->si_SchedulingInfo != NULL);
 
   if (strcmp(row, S.last_sib1_key) != 0) {
-    strncpy(S.last_sib1_key, row, sizeof(S.last_sib1_key) - 1);
+    snprintf(S.last_sib1_key, sizeof(S.last_sib1_key), "%s", row);
     /* row starts with pci; insert timestamp, sfn and slot in front of it */
     nr_sniffer_csv_row(&S.sib1_csv, "%lu,%d,%d,%s,%lu", nr_sniffer_now_us(), frame, slot, row, S.nb_sib1);
     printf("[SNIFFER] SIB1 decoded: PCI %d, PLMN %03d/%02d, TAC %ld, NCI 0x%09lx, band n%ld, %ld PRB @ %ld kHz, "
            "initial BWP %d+%d PRB, PRACH idx %ld, TDD %s %ldD/%ldU\n",
            pci, mcc, mnc, tac, (unsigned long)nci, band, carrier_bw, scs, bwp_start, bwp_size, prach_idx, tdd_period,
            tdd_dl_slots, tdd_ul_slots);
+    fflush(stdout);
     if (S.dump_xml) {
       char path[600];
       snprintf(path, sizeof(path), "%s/sib1_pci%d.xml", S.out_dir, pci);

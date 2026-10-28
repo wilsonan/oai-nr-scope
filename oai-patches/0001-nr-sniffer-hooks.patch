@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 5e58be3..2295244 100644
+index 5e58be3..a89d739 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -2276,3 +2276,8 @@ endif()
@@ -9,7 +9,7 @@ index 5e58be3..2295244 100644
 +
 +# nr-sniffer (passive 5G SA telemetry), linked in from the oai-nr-scope repository
 +if(EXISTS ${OPENAIR_DIR}/nr-sniffer/CMakeLists.txt)
-+  add_subdirectory(${OPENAIR_DIR}/nr-sniffer)
++  add_subdirectory(${OPENAIR_DIR}/nr-sniffer ${CMAKE_BINARY_DIR}/nr-sniffer-build)
 +endif()
 diff --git a/common/utils/nr_sniffer_hooks.h b/common/utils/nr_sniffer_hooks.h
 new file mode 100644
@@ -187,3 +187,91 @@ index c28bf15..7d6fc07 100644
          nr_rrc_process_sib1(rrc, SI_info, bcch_message->message.choice.c1->choice.systemInformationBlockType1);
          // mac layer will free after usage the sib1
          bcch_message->message.choice.c1->choice.systemInformationBlockType1 = NULL;
+diff --git a/radio/rfsimulator/simulator.cpp b/radio/rfsimulator/simulator.cpp
+index 4a381f0..a8d344c 100644
+--- a/radio/rfsimulator/simulator.cpp
++++ b/radio/rfsimulator/simulator.cpp
+@@ -762,45 +762,53 @@ static int startServer(openair0_device_t *device)
+   char port[6];
+   snprintf(port, sizeof(port), "%d", t->port);
+ 
+-  struct addrinfo hints = {
+-      .ai_flags = AI_PASSIVE,
+-      .ai_family = AF_INET6,
+-      .ai_socktype = SOCK_STREAM,
+-  };
+-
+-  int s = getaddrinfo(NULL, port, &hints, &results);
+-  if (s != 0) {
+-    LOG_E(HW, "getaddrinfo: %s\n", gai_strerror(s));
+-    freeaddrinfo(results);
+-    return -1;
+-  }
+-
+-  int enable = 1;
+-  int disable = 0;
+-  for (rp = results; rp != NULL; rp = rp->ai_next) {
+-    sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+-    if (sock == -1) {
++  // Dual-stack IPv6 first; fall back to IPv4 on hosts whose kernel has no IPv6 support.
++  const int families[] = {AF_INET6, AF_INET};
++  for (int f = 0; f < 2 && sock == -1; f++) {
++    struct addrinfo hints = {
++        .ai_flags = AI_PASSIVE,
++        .ai_family = families[f],
++        .ai_socktype = SOCK_STREAM,
++    };
++
++    int s = getaddrinfo(NULL, port, &hints, &results);
++    if (s != 0) {
++      LOG_W(HW, "getaddrinfo: %s\n", gai_strerror(s));
+       continue;
+     }
+ 
+-    if (setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &disable, sizeof(int)) != 0) {
+-      continue;
+-    }
++    int enable = 1;
++    int disable = 0;
++    for (rp = results; rp != NULL; rp = rp->ai_next) {
++      sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
++      if (sock == -1) {
++        continue;
++      }
+ 
+-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) != 0) {
+-      continue;
+-    }
++      if (rp->ai_family == AF_INET6 && setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &disable, sizeof(int)) != 0) {
++        close(sock);
++        sock = -1;
++        continue;
++      }
+ 
+-    if (bind(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
+-      break;
++      if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) != 0) {
++        close(sock);
++        sock = -1;
++        continue;
++      }
++
++      if (bind(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
++        break;
++      }
++
++      close(sock);
++      sock = -1;
+     }
+ 
+-    close(sock);
+-    sock = -1;
++    freeaddrinfo(results);
++    results = NULL;
+   }
+ 
+-  freeaddrinfo(results);
+-
+   if (sock <= 0) {
+     LOG_E(HW, "could not open a socket\n");
+     return -1;

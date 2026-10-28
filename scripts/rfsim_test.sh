@@ -70,8 +70,16 @@ done
 sleep 3  # let a few more MIBs come in
 
 grep "\[SNIFFER\]" "$OUT_DIR/sniffer.log" | head -20
+# The passivity verdict only means something if the gNB was up and the sniffer was attached to it.
+if ! kill -0 "$GNB_PID" 2>/dev/null || ! grep -q "Client connects" "$OUT_DIR/gnb.log"; then
+  echo "FAIL: the gNB is not running or nr-sniffer never connected to it, see $OUT_DIR/gnb.log"
+  echo "RESULT: FAIL"
+  exit 1
+fi
+# NR gNB PHY logs "[RAPROC] ... Initiating RA procedure" on PRACH detection, MAC "initiating RA procedure".
 if grep -qi "Initiating RA procedure" "$OUT_DIR/gnb.log"; then
   echo "FAIL: the gNB saw a random-access attempt, so the sniffer was not passive"
+  echo "RESULT: FAIL"
   exit 1
 fi
 echo "PASS: the gNB saw no random-access attempt (sniffer stayed passive)"

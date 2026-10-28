@@ -19,6 +19,8 @@ add_executable(nr-sniffer
 )
 
 target_include_directories(nr-sniffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Next to nr-softmodem/nr-uesoftmodem, where the radio and coding modules are loaded from.
+set_target_properties(nr-sniffer PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 target_link_libraries(nr-sniffer PRIVATE
   -Wl,--start-group
