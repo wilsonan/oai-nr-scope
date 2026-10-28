@@ -55,3 +55,15 @@ target_include_directories(nr-gnb-dci-logger PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src ${OPENAIR_DIR}/common/utils/T/tracer)
 target_link_libraries(nr-gnb-dci-logger PRIVATE tracer_utils asn1_nr_rrc_hdrs)
 set_target_properties(nr-gnb-dci-logger PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Unit tests (scripts/unit_tests.sh): the RA tracker and the DCI schema, without radio or UE
+add_executable(nr-sniffer-unit-tests
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sniffer.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_ra.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_csv.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nr_sniffer_dci.c
+)
+target_include_directories(nr-sniffer-unit-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(nr-sniffer-unit-tests PRIVATE
+  -Wl,--start-group MAC_NR_COMMON nr_common UTIL asn1_nr_rrc asn1_nr_rrc_hdrs -Wl,--end-group pthread m)
+set_target_properties(nr-sniffer-unit-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

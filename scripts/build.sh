@@ -17,6 +17,6 @@ cd "$BUILD_DIR"
 if [ ! -f build.ninja ]; then
   cmake ../../.. -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 fi
-ninja -j"$JOBS" nr-sniffer nr-gnb-dci-logger nr-softmodem nr-uesoftmodem \
+ninja -j"$JOBS" nr-sniffer nr-gnb-dci-logger nr-sniffer-unit-tests nr-softmodem nr-uesoftmodem \
   params_libconfig coding rfsimulator dfts params_yaml ${EXTRA_TARGETS:-}
 echo "Built: $BUILD_DIR/nr-sniffer $BUILD_DIR/nr-gnb-dci-logger"

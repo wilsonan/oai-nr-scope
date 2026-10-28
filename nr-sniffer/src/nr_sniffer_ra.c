@@ -45,6 +45,19 @@ static struct {
   uint16_t known_rnti;
 } R = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
+void nr_sniffer_ra_reset(void)
+{
+  pthread_mutex_lock(&R.lock);
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, R.known_cg);
+  R.known_cg = NULL;
+  R.known_rnti = 0;
+  R.nb_ra = 0;
+  R.nb_tc = 0;
+  R.adopted = 0;
+  R.last_tc_dl = 0;
+  pthread_mutex_unlock(&R.lock);
+}
+
 void nr_sniffer_ra_init(const char *out_dir, bool follow)
 {
   R.follow = follow;

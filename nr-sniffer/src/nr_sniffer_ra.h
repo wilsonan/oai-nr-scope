@@ -22,6 +22,8 @@ void nr_sniffer_ra_configure(const void *sib1, bool fr2);
 /// NR_RRCReconfiguration (e.g. phy-test's reconfig.raw). \p rnti < 0 takes the C-RNTI from
 /// reconfigurationWithSync. Returns false if the file cannot be used.
 bool nr_sniffer_ra_load_known_ue(const char *path, int rnti);
+/// Forget all tracked RNTIs, the followed UE and any known configuration (unit tests; output files stay open).
+void nr_sniffer_ra_reset(void);
 /// Every DCI the sniffer decodes (used to find the Msg4 TC-RNTI).
 void nr_sniffer_ra_on_dci(const nr_sniffer_dci_t *dci);
 

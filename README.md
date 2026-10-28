@@ -45,13 +45,33 @@ Milestone 3 is **in progress**:
 ```bash
 scripts/setup_oai.sh                    # clones OAI 2026.w41 into ./oai, applies patches, links nr-sniffer
 (cd oai/cmake_targets && ./build_oai -I) # OAI build dependencies (once)
-scripts/build.sh                        # nr-sniffer, nr-softmodem, nr-uesoftmodem, rfsimulator
+scripts/build.sh                        # nr-sniffer, nr-softmodem, nr-uesoftmodem, rfsimulator, unit tests
+scripts/unit_tests.sh                   # C + Python unit tests, a few seconds
 scripts/rfsim_test.sh                   # gNB (rfsim) + sniffer, checks MIB/SIB1 against the gNB config
 scripts/gnb_dci_test.sh                 # gNB (rfsim, T-tracer) + nr-gnb-dci-logger + one UE
 scripts/dci_test.sh                     # + nr-sniffer following the UE; compares its DCIs with the gNB's
 scripts/phytest_dci_test.sh             # phy-test gNB/UE/sniffer, DCI 0_1/1_1 with a known configuration
 scripts/known_ue_test.sh                # SA, sniffer joins late with the UE's CellGroupConfig from the gNB
 ```
+
+## Tests
+
+`scripts/unit_tests.sh` takes a few seconds and needs no radio or rfsim. Run it after every change:
+
+- `nr-sniffer-unit-tests` (C, `nr-sniffer/tests/`) covers:
+  - the RA-RNTI set from a real SIB1;
+  - RAR parsing, including a truncated PDU;
+  - tracked-RNTI matching (CRC remainder, PDCCH configuration);
+  - Msg4 adoption, one UE only, and that a Msg3 grant is not mistaken for a Msg4;
+  - known-configuration loading (CellGroupConfig, phy-test RRCReconfiguration, wrong files);
+  - the DCI CSV row.
+
+  The fixtures in `nr-sniffer/tests/data/` come from rfsim runs.
+- `scripts/tests/` (Python) runs `compare_dci.py` and `check_gnb_dci.py` on synthetic logs. It
+  covers misses, false positives, field mismatches, a sniffer PRACH, matching across the SFN wrap,
+  and the start of the window for known-configuration and phy-test runs.
+
+The rfsim end-to-end tests are listed under Quick start.
 
 Running the sniffer against a cell (start it before the UEs you want to follow attach):
 
