@@ -148,6 +148,8 @@ should say all tests passed.
 
 ## 3. The one-command demo
 
+A recording of this demo is in [media/rfsim-demo.gif](media/rfsim-demo.gif) ([MP4](media/rfsim-demo.mp4)).
+
 ```bash
 scripts/rfsim_demo.sh --ues 2
 ```

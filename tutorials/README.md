@@ -5,6 +5,24 @@
 | [01 – nr-sniffer with the OAI RF simulator](01-rfsim-tutorial.md) | Build everything, run a gNB, UEs and the sniffer in the RF simulator, watch the sniffer follow the UEs, check it against the gNB, generate traffic, follow a UE that is already connected |
 | [02 – Output reference](02-output-reference.md) | Every log line, CSV file and column the sniffer and the gNB logger write, and what it means |
 
+## Watch it first
+
+![nr-sniffer demo in the OAI RF simulator](media/rfsim-demo.gif)
+
+This is a real recording of `scripts/rfsim_demo.sh --ues 2`, about 2.5 minutes long
+([MP4](media/rfsim-demo.mp4), [asciinema cast](media/rfsim-demo.cast)). It shows, in order:
+
+1. the live view finding the cell (from the MIB and SIB1) with no UE yet;
+2. the two UEs attaching, one after the other, and the sniffer following each from its random
+   access;
+3. about one downlink and ten uplink DCIs per second per UE, which is signalling only because there
+   is no core network;
+4. after the stop, the comparison with the gNB: 0 of 711 DCIs missed, all fields equal,
+   `RESULT: PASS`;
+5. the sniffer's own log lines and the first rows of `dci.csv`.
+
+`media/record_demo.sh` re-records it.
+
 ## Five-minute version
 
 After the build (tutorial 01, step 1), run this from the repository root:
