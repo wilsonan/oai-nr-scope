@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "common/utils/nr/nr_common.h"
 #include "executables/softmodem-common.h"
@@ -271,7 +272,7 @@ static void test_msg4_not_followed(NR_SIB1_t *sib1)
 
 static void test_max_ues(NR_SIB1_t *sib1)
 {
-  nr_sniffer_ra_init(out_dir, true, 1);
+  nr_sniffer_ra_init(out_dir, true, 1, 0);
   nr_sniffer_ra_reset();
   nr_sniffer_ra_configure(sib1, false);
   uint8_t pdu[32];
@@ -289,7 +290,83 @@ static void test_max_ues(NR_SIB1_t *sib1)
   CHECK(nr_sniffer_on_msg4(msg4, msg4_len, 132, 10, &rnti, &cg, &instance));
   CHECK(cg == NULL); /* max_ues 1 */
   CHECK(nr_sniffer_shadow_instance(0xc85d) == -1);
-  nr_sniffer_ra_init(out_dir, true, NR_SNIFFER_MAX_UES);
+  nr_sniffer_ra_init(out_dir, true, NR_SNIFFER_MAX_UES, 0);
+}
+
+/* last line of out_dir/name */
+static void last_line(const char *name, char *line, int size)
+{
+  char path[600];
+  snprintf(path, sizeof(path), "%s/%s", out_dir, name);
+  FILE *f = fopen(path, "r");
+  line[0] = 0;
+  if (!f)
+    return;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), f))
+    snprintf(line, size, "%s", buf);
+  fclose(f);
+}
+
+static void c_rnti_dci(int rnti)
+{
+  const nr_sniffer_dci_t d = dci(rnti, TYPE_C_RNTI_, NR_UL_DCI_FORMAT_0_0);
+  nr_sniffer_ra_on_dci(&d);
+}
+
+/* a UE without DCIs for ue_timeout is no longer followed, and its shadow MAC instance follows the next UE */
+static void test_ue_timeout_and_reuse(NR_SIB1_t *sib1)
+{
+  nr_sniffer_ra_init(out_dir, true, 2, 0.2);
+  nr_sniffer_ra_reset();
+  nr_sniffer_ra_configure(sib1, false);
+  uint8_t pdu[32];
+  nr_sniffer_on_rar(pdu, build_rar(pdu), 130, 10); /* TC-RNTIs c85d, 2b6c */
+  static uint8_t msg4[8192];
+  const int msg4_len = build_msg4(msg4, sizeof(msg4));
+  uint16_t rnti;
+  void *cg = NULL;
+  int instance;
+  char line[1024];
+  decoded_msg4_dci(0x2b6c);
+  CHECK(nr_sniffer_on_msg4(msg4, msg4_len, 131, 10, &rnti, &cg, &instance) && cg && instance == 1);
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  last_line("ue.csv", line, sizeof(line));
+  CHECK(strstr(line, ",0x2b6c,follow,0x102030405060") != NULL);
+  cg = NULL;
+  decoded_msg4_dci(0xc85d);
+  CHECK(nr_sniffer_on_msg4(msg4, msg4_len, 132, 10, &rnti, &cg, &instance) && cg && instance == 2);
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+
+  /* only c85d keeps being scheduled */
+  int ids[NR_SNIFFER_MAX_SHADOWS];
+  for (int i = 0; i < 6; i++) {
+    usleep(50000);
+    c_rnti_dci(0xc85d);
+    nr_sniffer_shadow_instances(ids, NR_SNIFFER_MAX_SHADOWS);
+  }
+  const int n = nr_sniffer_shadow_instances(ids, NR_SNIFFER_MAX_SHADOWS);
+  CHECK(n == 1 && ids[0] == 2);
+  CHECK(nr_sniffer_shadow_instance(0x2b6c) == -1);
+  CHECK(nr_sniffer_shadow_instance(0xc85d) == 2);
+  last_line("ue.csv", line, sizeof(line));
+  CHECK(strstr(line, ",0x2b6c,left,") != NULL);
+
+  /* the next UE gets the freed instance 1 */
+  const uint8_t rar3[] = {0x40 | 7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4d, 0x01}; /* RAPID 7, TC-RNTI 4d01 */
+  nr_sniffer_on_rar(rar3, sizeof(rar3), 200, 10);
+  cg = NULL;
+  decoded_msg4_dci(0x4d01);
+  CHECK(nr_sniffer_on_msg4(msg4, msg4_len, 201, 10, &rnti, &cg, &instance) && cg && instance == 1 && rnti == 0x4d01);
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  CHECK(nr_sniffer_shadow_instance(0x4d01) == 1);
+
+  /* a UE that left can be followed again when it comes back (new random access) */
+  nr_sniffer_on_rar(pdu, build_rar(pdu), 300, 10);
+  cg = NULL;
+  decoded_msg4_dci(0x2b6c);
+  CHECK(nr_sniffer_on_msg4(msg4, msg4_len, 301, 10, &rnti, &cg, &instance) && cg == NULL); /* max_ues 2 reached */
+  nr_sniffer_ra_init(out_dir, true, NR_SNIFFER_MAX_UES, 0);
 }
 
 static void test_known_ue(NR_SIB1_t *sib1)
@@ -424,7 +501,7 @@ int main(int argc, char **argv)
   data_dir = argv[1];
   out_dir = argv[2];
   logInit(); /* OAI's LOG macros (used by the MAC helpers) need it, as in OAI's own unit tests */
-  nr_sniffer_ra_init(out_dir, true, NR_SNIFFER_MAX_UES);
+  nr_sniffer_ra_init(out_dir, true, NR_SNIFFER_MAX_UES, 0);
   NR_SIB1_t *sib1 = load_sib1();
 
   test_ra_rnti_set(sib1);
@@ -432,6 +509,7 @@ int main(int argc, char **argv)
   test_rar_and_msg4(sib1);
   test_msg4_not_followed(sib1);
   test_max_ues(sib1);
+  test_ue_timeout_and_reuse(sib1);
   test_known_ue(sib1);
   test_sib1_copy(sib1);
   test_dci_row();

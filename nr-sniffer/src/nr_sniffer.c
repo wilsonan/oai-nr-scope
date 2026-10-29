@@ -41,6 +41,8 @@ static struct {
   char *cellgroup_file;
   int rnti;
   int max_ues;
+  int merge_pdcch;
+  double ue_timeout;
   /* outputs */
   nr_sniffer_csv_t mib_csv;
   nr_sniffer_csv_t sib1_csv;
@@ -49,6 +51,8 @@ static struct {
   int last_pci;
   bool fr2;
   uint64_t nb_dci;
+  /* per-slot statistics, printed every STATS_SLOTS slots */
+  uint64_t nb_slots, nb_pdcch_configs, nb_pdcch_merged;
   char last_mib_key[256];
   char last_sib1_key[1024];
   uint64_t nb_mib;
@@ -110,6 +114,10 @@ void nr_sniffer_init(configmodule_interface_t *cfg)
                   &S.cellgroup_file, ""),
       INTPARAM("rnti", "C-RNTI of the UE in cellgroup_file (-1: from its reconfigurationWithSync)", 0, &S.rnti, -1),
       INTPARAM("max_ues", "follow at most this many UEs at once (1..14)", 0, &S.max_ues, 8),
+      DOUBLEPARAM("ue_timeout", "seconds without a DCI after which a UE is no longer followed (0: never)", 0,
+                  &S.ue_timeout, 10.0),
+      INTPARAM("merge_pdcch", "1: decode PDCCH configurations that differ only in the RNTI once for all UEs (default)",
+               PARAMFLAG_BOOL, &S.merge_pdcch, 1),
   };
   config_get(cfg, params, sizeof(params) / sizeof(params[0]), SNIFFER_SECTION);
 
@@ -118,7 +126,7 @@ void nr_sniffer_init(configmodule_interface_t *cfg)
   nr_sniffer_csv_open(&S.mib_csv, S.out_dir, "mib.csv", MIB_HEADER);
   nr_sniffer_csv_open(&S.sib1_csv, S.out_dir, "sib1.csv", SIB1_HEADER);
   nr_sniffer_csv_open(&S.dci_csv, S.out_dir, "dci.csv", NR_SNIFFER_DCI_HEADER);
-  nr_sniffer_ra_init(S.out_dir, S.passive && S.follow_ue, S.max_ues);
+  nr_sniffer_ra_init(S.out_dir, S.passive && S.follow_ue, S.max_ues, S.ue_timeout);
   if (S.cellgroup_file && S.cellgroup_file[0] && !nr_sniffer_ra_load_known_ue(S.cellgroup_file, S.rnti))
     exit(1);
 
@@ -370,4 +378,36 @@ void nr_sniffer_on_dci(const nr_sniffer_dci_t *dci)
   S.nb_dci++;
   nr_sniffer_csv_row(&S.dci_csv, "%s", row);
   pthread_mutex_unlock(&S.lock);
+}
+
+/* ------------------------------------------------------------------------- */
+/* statistics                                                                */
+/* ------------------------------------------------------------------------- */
+
+#define STATS_SLOTS 2000 /* 1 s at 30 kHz */
+
+void nr_sniffer_on_slot(int frame, int slot, int nb_configs, int nb_merged)
+{
+  if (!S.initialized)
+    return;
+  pthread_mutex_lock(&S.lock);
+  S.nb_slots++;
+  S.nb_pdcch_configs += nb_configs;
+  S.nb_pdcch_merged += nb_merged;
+  if (S.nb_slots % STATS_SLOTS == 0) {
+    int ids[NR_SNIFFER_MAX_SHADOWS];
+    const int nb_ues = nr_sniffer_shadow_instances(ids, NR_SNIFFER_MAX_SHADOWS);
+    printf("[SNIFFER] stats at %d.%d: %lu slots, %lu DCIs logged, %d UEs followed, %.2f PDCCH configurations per slot"
+           " (%.2f more merged into them)\n",
+           frame, slot, S.nb_slots, S.nb_dci, nb_ues, (double)S.nb_pdcch_configs / STATS_SLOTS,
+           (double)S.nb_pdcch_merged / STATS_SLOTS);
+    fflush(stdout);
+    S.nb_pdcch_configs = S.nb_pdcch_merged = 0;
+  }
+  pthread_mutex_unlock(&S.lock);
+}
+
+bool nr_sniffer_merge_pdcch(void)
+{
+  return S.merge_pdcch;
 }

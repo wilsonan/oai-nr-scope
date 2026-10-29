@@ -15,7 +15,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OAI_DIR="${1:-$REPO_DIR/oai}"
 BUILD_DIR="$OAI_DIR/cmake_targets/ran_build/build"
 GNB_CONF="${GNB_CONF:-$OAI_DIR/ci-scripts/conf_files/gnb.sa.band78.106prb.rfsim.conf}"
-UE_CONF="${UE_CONF:-$OAI_DIR/ci-scripts/conf_files/nrue.uicc.conf}"
+UE_CONF="${UE_CONF-$OAI_DIR/ci-scripts/conf_files/nrue.uicc.conf}"  # UE_CONF="": no -O
 T_DB="$OAI_DIR/common/utils/T/T_messages.txt"
 OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
 mkdir -p "$OUT_DIR" && OUT_DIR="$(cd "$OUT_DIR" && pwd)"
@@ -79,7 +79,7 @@ start_gnb() {
 }
 
 start_ue() {
-  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-uesoftmodem" -O "$UE_CONF" "${TUNING[@]}" --uicc0.imsi 208990100001100 "$@") \
+  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-uesoftmodem" ${UE_CONF:+-O "$UE_CONF"} "${TUNING[@]}" --uicc0.imsi 208990100001100 "$@") \
       > "$OUT_DIR/ue.log" 2>&1 &
   UE_PID=$!
   STARTED_PIDS+=("$UE_PID")
@@ -89,7 +89,7 @@ start_ue() {
 start_ue_n() {
   local n=$1
   shift
-  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-uesoftmodem" -O "$UE_CONF" "${TUNING[@]}" \
+  (cd "$OUT_DIR" && exec "$BUILD_DIR/nr-uesoftmodem" ${UE_CONF:+-O "$UE_CONF"} "${TUNING[@]}" \
        --uicc0.imsi "$(printf '2089901000011%02d' "$n")" "$@") > "$OUT_DIR/ue$n.log" 2>&1 &
   UE_PIDS+=($!)
   STARTED_PIDS+=($!)

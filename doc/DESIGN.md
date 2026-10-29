@@ -25,8 +25,10 @@ oai-nr-scope/                       (this repository)
 ├── scripts/phytest_dci_test.sh     M3: known configuration in phy-test (DCI 0_1/1_1)
 ├── scripts/known_ue_test.sh        M3: known configuration in SA (CellGroupConfig exported from the gNB)
 ├── scripts/multi_ue_test.sh        M3: several UEs followed at once (shadow MAC instances)
+├── scripts/ue_reuse_test.sh        M3: a UE leaves, its shadow instance follows the next UE
+├── scripts/sniffer_live.py         live per-RNTI view of dci.csv (or gnb_dci.csv)
 └── scripts/unit_tests.sh           C and Python unit tests (nr-sniffer/tests/, scripts/tests/)
-├── scripts/compare_dci.py          DCI matching per UE: miss rate, false positives, field agreement
+├── scripts/compare_dci.py          component C: per-UE miss rate, false positives, fields, throughput (--report)
 ```
 
 `nr-sniffer` is a separate executable. It is compiled from the same sources as `nr-uesoftmodem`
@@ -38,7 +40,7 @@ deliberately small:
 | `common/utils/nr_sniffer_hooks.h` (new) | Weak hook declarations: `nr_sniffer_init`, `nr_sniffer_on_mib`, `nr_sniffer_on_sib1`, `nr_sniffer_is_passive`, and for M2 `nr_sniffer_on_dci`, `nr_sniffer_match_rnti`, `nr_sniffer_rnti_type`, `nr_sniffer_ra_watch_rnti`, `nr_sniffer_on_rar`, and for M3 `nr_sniffer_on_msg4`, `nr_sniffer_known_ue`, `nr_sniffer_shadow_instance(s)`, `nr_sniffer_sib1`; `nr_sniffer_dci_t` |
 | `openair2/LAYER2/NR_MAC_UE/nr_ue_procedures.c` | `nr_ue_decode_mib()` reports the decoded MIB plus PCI/SSB index. M2: `get_rnti_type()` knows tracked RA/TC-RNTIs; RA-RNTI DCIs are decoded outside an own RA window when passive; RARs go to `nr_sniffer_on_rar()`; M3: another UE's Msg4 goes to `nr_sniffer_on_msg4()` (never to this UE's RRC) and its RRCSetup creates a shadow MAC instance; MIB logging only for the main instance; no RA is triggered on DL data while passive; each successfully processed DCI 0_0/0_1/1_0/1_1 is reported with its PDSCH/PUSCH allocation |
 | `openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c` | M2: monitor the RA search space for tracked RNTIs when not doing an own RA (main instance only); pass SS/CORESET ids to the PHY |
-| `openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c` | M3: each shadow instance adds its search spaces to the main instance's per-slot PDCCH request |
+| `openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c` | M3: each shadow instance adds its search spaces to the main instance's per-slot PDCCH request, then identical ones are merged (`nr_ue_merge_dci_configs()` in `nr_ue_dci_configuration.c`); per-slot statistics hook |
 | `openair2/NR_UE_PHY_INTERFACE/NR_IF_Module.c` | M3: a DCI on a followed C-RNTI is processed by its shadow instance; its PDSCH/PUSCH config is dropped |
 | `openair2/LAYER2/NR_MAC_UE/mac_defs.h`, `nfapi/.../fapi_nr_ue_constants.h` | M3: `sniffer_shadow` flag; `FAPI_NR_DL_CONFIG_LIST_NUM` 10 → 32 |
 | `openair2/LAYER2/NR_MAC_UE/nr_ra_procedures.c` | M2: `trigger_MAC_UE_RA()` is a no-op when passive |
@@ -106,10 +108,41 @@ UL: fapi_nr_ue_l1.c drops all UL config of the main instance when passive (no PR
     PUCCH, SRS); shadows have no PHY, and their UL config is flushed after each DCI.
 ```
 
-Limits: up to `max_ues` UEs at once (default 8, at most 14: `FAPI_NR_DL_CONFIG_LIST_NUM` is raised
-to 32, and each UE adds about two search spaces). Instances are not reused yet, so a UE that leaves
-keeps its instance. A UE must start random access while the sniffer runs, unless its configuration
-is known. A BWP switch by DCI is not followed (the shadow does not process its own PDSCH/MAC CEs).
+**One PDCCH pass for identical search spaces.** After each shadow has added its search spaces,
+`nr_ue_merge_dci_configs()` folds every configuration that equals an earlier one except for the RNTI
+(same CORESET, scrambling, candidates and DCI sizes) into it, as an extra RNTI in its `extra_rnti`
+list. The PHY demodulates and polar-decodes such a configuration once and accepts any of its RNTIs.
+In OAI's configuration all followed UEs share common search space 4 on CORESET 0, so with 6 UEs the
+PHY gets 6.56 instead of 13 configurations per slot. UE-specific search spaces differ per C-RNTI
+(TS 38.213 hashing) and stay separate. `--sniffer.merge_pdcch 0` turns merging off.
+
+**UEs that leave.** A followed UE without a DCI for `--sniffer.ue_timeout` seconds (default 10) is no
+longer followed (`ue.csv` event `left`). Its shadow instance is reused for the next UE: it is reset with
+`GO_TO_IDLE_KEEP_CAMPED`, which drops the old UE's dedicated configuration and keeps the cell's.
+
+Limits: up to `max_ues` UEs at once (default 8, at most 14). A UE must start random access while the
+sniffer runs, unless its configuration is known. A BWP switch by DCI is not followed (the shadow does
+not process its own PDSCH/MAC CEs).
+
+## Worker pool and real-time
+
+PLAN.md asked for slot buffers to be handed to worker threads, so that decoding does not have to
+finish within one slot. OAI's nrUE already does this. Each received slot goes to one of
+`--num-dl-actors` DL actor threads (default 4, round-robin by slot; `--actor-affinity` pins them to
+cores). PDSCH LDPC decoding also runs on a thread pool. The sniffer keeps its state behind a mutex,
+and each shadow MAC instance behind its own `if_mutex`, so slots processed in parallel are safe.
+Measured in the cloud VM (rfsim, 30 kHz, 106 PRB):
+
+| UEs followed | nr-sniffer CPU | slots | CPU per slot |
+|---|---|---|---|
+| 1 | 76 s | 160 000 | 0.48 ms |
+| 6 (PDCCH merged) | 255 s | 520 000 | 0.49 ms |
+| 6 (not merged) | 249 s | 506 000 | 0.49 ms |
+
+The per-UE cost is small: synchronisation, FFTs and rfsim I/O dominate. One slot at 30 kHz is 0.5 ms,
+so the sniffer needs about one core's worth of CPU, spread over the DL actors. On a USRP, give it
+`--num-dl-actors` ≥ 2 and dedicated cores with `--actor-affinity`. The `[SNIFFER] stats` line, every
+2000 slots, reports the PDCCH configurations per slot.
 
 ## Known configuration (M3)
 
@@ -252,7 +285,9 @@ tdd_dl_slots,tdd_dl_symbols,tdd_ul_slots,tdd_ul_symbols,si_scheduling_present,nb
 
 `rar.csv` (M2, one row per RAR subPDU): `timestamp_us,sfn,slot,rapid,timing_advance,ul_grant,tc_rnti`
 
-`ue.csv` (M2, the UE being followed): `timestamp_us,sfn,slot,c_rnti,contention_resolution_id`
+`ue.csv` (one row per change of the followed UEs): `timestamp_us,sfn,slot,c_rnti,event,contention_resolution_id`.
+`event` is `follow` (Msg4 decoded; `contention_resolution_id` is from its MAC CE), `known` (a
+`cellgroup_file` UE, after SIB1) or `left` (no DCI for `ue_timeout`).
 
 `dci.csv` (M2) and `gnb_dci.csv` (component B) share one schema (`nr-sniffer/src/nr_sniffer_dci.h`).
 `rnti` is hex, `rnti_type` is one of `c,cs,tc,p,si,ra,msgb,mcs-c`, `dci_format` is e.g. `1_0`,
@@ -292,6 +327,8 @@ section of the `-O` config file. See `nr-sniffer/conf/nr-sniffer.conf`.
 | `mcs_table` | `qam256` | MCS table assumed with a known configuration (M3). In M2 the MCS table comes from the decoded RRCSetup (`pdsch-Config.mcs-Table`) |
 | `dump_xml` | `1` | Write each new SIB1 as XER |
 | `max_ues` | `8` | Follow at most this many UEs at once (1..14) |
+| `ue_timeout` | `10` | Seconds without a DCI after which a UE is no longer followed and its shadow instance is freed (0: never) |
+| `merge_pdcch` | `1` | Decode PDCCH configurations that differ only in the RNTI once for all UEs |
 | `cellgroup_file` | `""` | Follow a UE with this known UPER CellGroupConfig or RRCReconfiguration (M3) |
 | `rnti` | `-1` | C-RNTI of the UE in `cellgroup_file`; `-1` takes it from `reconfigurationWithSync` |
 | `follow_ue` | `1` | Follow the first UE seen in random access and log its DCIs; `0` is M1 behaviour (MIB/SIB1 only) |

@@ -48,6 +48,8 @@ typedef struct {
 typedef struct {
   uint16_t rnti;
   int instance; ///< shadow MAC instance in OAI's UE MAC
+  bool active; ///< false: the UE left (no DCI for ue_timeout); its instance can follow another UE
+  uint64_t last_us; ///< last DCI decoded for it (or when following started)
 } followed_ue_t;
 
 typedef struct {
@@ -59,6 +61,7 @@ static struct {
   pthread_mutex_t lock;
   bool follow;
   int max_ues;
+  uint64_t ue_timeout_us; ///< 0: never stop following a UE
   int nb_ra;
   uint16_t ra[MAX_RA_RNTI];
   int nb_tc;
@@ -88,12 +91,13 @@ void nr_sniffer_ra_reset(void)
   pthread_mutex_unlock(&R.lock);
 }
 
-void nr_sniffer_ra_init(const char *out_dir, bool follow, int max_ues)
+void nr_sniffer_ra_init(const char *out_dir, bool follow, int max_ues, double ue_timeout_s)
 {
   R.follow = follow;
   R.max_ues = max_ues < 0 ? 0 : max_ues > NR_SNIFFER_MAX_UES ? NR_SNIFFER_MAX_UES : max_ues;
+  R.ue_timeout_us = ue_timeout_s > 0 ? (uint64_t)(ue_timeout_s * 1e6) : 0;
   nr_sniffer_csv_open(&R.rar_csv, out_dir, "rar.csv", "timestamp_us,sfn,slot,rapid,timing_advance,ul_grant,tc_rnti");
-  nr_sniffer_csv_open(&R.ue_csv, out_dir, "ue.csv", "timestamp_us,sfn,slot,c_rnti,contention_resolution_id");
+  nr_sniffer_csv_open(&R.ue_csv, out_dir, "ue.csv", "timestamp_us,sfn,slot,c_rnti,event,contention_resolution_id");
 }
 
 static bool in_list(const uint16_t *list, int n, uint16_t rnti)
@@ -117,23 +121,58 @@ static void remove_tc(int i)
   R.tc[i] = R.tc[--R.nb_tc];
 }
 
+/* index of the followed (active) UE with this RNTI, or -1 */
 static int find_ue(uint16_t rnti)
 {
   for (int i = 0; i < R.nb_ues; i++)
-    if (R.ues[i].rnti == rnti)
+    if (R.ues[i].active && R.ues[i].rnti == rnti)
       return i;
   return -1;
 }
 
-/* Follow \p rnti in the next shadow MAC instance; -1 if the table is full or it is already followed.
- * Instances are never reused, so one instance always means one UE in the logs. */
+static int nb_active_ues(void)
+{
+  int n = 0;
+  for (int i = 0; i < R.nb_ues; i++)
+    n += R.ues[i].active;
+  return n;
+}
+
+/* Follow \p rnti in a shadow MAC instance: the one of a UE that left, else a new one. -1 if max_ues UEs are
+ * followed already, or this one is. */
 static int add_ue(uint16_t rnti)
 {
-  if (R.nb_ues >= R.max_ues || find_ue(rnti) >= 0)
+  if (nb_active_ues() >= R.max_ues || find_ue(rnti) >= 0)
+    return -1;
+  const uint64_t now = nr_sniffer_now_us();
+  for (int i = 0; i < R.nb_ues; i++)
+    if (!R.ues[i].active) {
+      R.ues[i] = (followed_ue_t){.rnti = rnti, .instance = R.ues[i].instance, .active = true, .last_us = now};
+      return R.ues[i].instance;
+    }
+  if (R.nb_ues >= NR_SNIFFER_MAX_UES)
     return -1;
   const int instance = R.nb_ues + 1;
-  R.ues[R.nb_ues++] = (followed_ue_t){.rnti = rnti, .instance = instance};
+  R.ues[R.nb_ues++] = (followed_ue_t){.rnti = rnti, .instance = instance, .active = true, .last_us = now};
   return instance;
+}
+
+/* stop following UEs without a DCI for ue_timeout (they left: RRC release, radio link failure, ...) */
+static void expire_ues(void)
+{
+  if (!R.ue_timeout_us)
+    return;
+  const uint64_t now = nr_sniffer_now_us();
+  for (int i = 0; i < R.nb_ues; i++) {
+    followed_ue_t *u = &R.ues[i];
+    if (u->active && now - u->last_us > R.ue_timeout_us) {
+      u->active = false;
+      nr_sniffer_csv_row(&R.ue_csv, "%lu,-1,-1,0x%04x,left,", now, u->rnti);
+      printf("[SNIFFER] UE %04x: no DCI for %.1f s, no longer followed (shadow MAC %d is free)\n", u->rnti,
+             R.ue_timeout_us / 1e6, u->instance);
+      fflush(stdout);
+    }
+  }
 }
 
 /* RA-RNTI = 1 + s_id + 14 t_id + 14 * 80 * f_id (TS 38.321 5.1.3) for every PRACH occasion of the
@@ -334,24 +373,27 @@ bool nr_sniffer_on_msg4(const uint8_t *pdu, int len, int frame, int slot, uint16
     return false; /* not a Msg4 */
 
   pthread_mutex_lock(&R.lock);
+  expire_ues();
   const uint16_t tc = R.last_tc_dl;
   const int i = find_tc(tc);
+  const bool room = nb_active_ues() < R.max_ues;
   NR_CellGroupConfig_t *cg = NULL;
   int inst = -1;
-  if (R.follow && i >= 0 && ccch && R.nb_ues < R.max_ues && (cg = cellgroup_from_rrcsetup(ccch, ccch_len))) {
-    inst = add_ue(tc);
+  if (R.follow && i >= 0 && ccch && room && (cg = cellgroup_from_rrcsetup(ccch, ccch_len))
+      && (inst = add_ue(tc)) > 0) {
     remove_tc(i); /* from now on its shadow MAC instance owns this RNTI */
-    nr_sniffer_csv_row(&R.ue_csv, "%lu,%d,%d,0x%04x,0x%02x%02x%02x%02x%02x%02x", nr_sniffer_now_us(), frame, slot, tc,
-                       cont_res[0], cont_res[1], cont_res[2], cont_res[3], cont_res[4], cont_res[5]);
+    nr_sniffer_csv_row(&R.ue_csv, "%lu,%d,%d,0x%04x,follow,0x%02x%02x%02x%02x%02x%02x", nr_sniffer_now_us(), frame, slot,
+                       tc, cont_res[0], cont_res[1], cont_res[2], cont_res[3], cont_res[4], cont_res[5]);
     printf("[SNIFFER] Msg4 at %d.%d: following UE with C-RNTI %04x (shadow MAC %d, %d UEs followed)\n", frame, slot, tc,
-           inst, R.nb_ues);
+           inst, nb_active_ues());
     *rnti = tc;
     *cell_group = cg;
     *instance = inst;
   } else {
+    ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
     printf("[SNIFFER] Msg4 at %d.%d on TC-RNTI %04x not followed (%s)\n", frame, slot, tc,
-           i < 0 ? "TC-RNTI not from a decoded RAR" : !ccch ? "no RRCSetup" : R.nb_ues >= R.max_ues ? "max_ues reached"
-                                                                                                    : "RRCSetup not decoded");
+           i < 0 ? "TC-RNTI not from a decoded RAR" : !ccch ? "no RRCSetup" : !room ? "max_ues reached"
+                                                                                  : "RRCSetup not decoded");
   }
   fflush(stdout);
   pthread_mutex_unlock(&R.lock);
@@ -370,20 +412,26 @@ int nr_sniffer_shadow_instance(uint16_t rnti)
 int nr_sniffer_shadow_instances(int *instances, int max)
 {
   pthread_mutex_lock(&R.lock);
+  expire_ues(); /* called every slot by the MAC */
   int n = 0;
-  for (; n < R.nb_ues && n < max; n++)
-    instances[n] = R.ues[n].instance;
+  for (int i = 0; i < R.nb_ues && n < max; i++)
+    if (R.ues[i].active)
+      instances[n++] = R.ues[i].instance;
   pthread_mutex_unlock(&R.lock);
   return n;
 }
 
 void nr_sniffer_ra_on_dci(const nr_sniffer_dci_t *dci)
 {
-  if (dci->rnti_type == TYPE_TC_RNTI_ && (dci->dci_format == NR_DL_DCI_FORMAT_1_0)) {
-    pthread_mutex_lock(&R.lock);
+  pthread_mutex_lock(&R.lock);
+  if (dci->rnti_type == TYPE_TC_RNTI_ && dci->dci_format == NR_DL_DCI_FORMAT_1_0) {
     R.last_tc_dl = dci->rnti;
-    pthread_mutex_unlock(&R.lock);
+  } else if (dci->rnti_type == TYPE_C_RNTI_) {
+    const int i = find_ue(dci->rnti);
+    if (i >= 0)
+      R.ues[i].last_us = nr_sniffer_now_us();
   }
+  pthread_mutex_unlock(&R.lock);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -471,7 +519,7 @@ void *nr_sniffer_known_ue(uint16_t *rnti, int *instance)
     cg = k.cg;
     *rnti = k.rnti;
     *instance = inst;
-    nr_sniffer_csv_row(&R.ue_csv, "%lu,-1,-1,0x%04x,known", nr_sniffer_now_us(), k.rnti);
+    nr_sniffer_csv_row(&R.ue_csv, "%lu,-1,-1,0x%04x,known,", nr_sniffer_now_us(), k.rnti);
     printf("[SNIFFER] SIB1 applied: following UE with C-RNTI %04x (known configuration, shadow MAC %d)\n", k.rnti, inst);
     fflush(stdout);
   }

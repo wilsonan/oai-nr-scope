@@ -8,6 +8,7 @@
 # Env:   NUM_UES  number of UEs (default 3)
 #        DURATION seconds to record after the last UE is connected (default 20)
 #        OUT_DIR  where logs and CSVs go (default: ./multi-ue-test-out)
+#        SNIFFER_ARGS extra nr-sniffer options, e.g. "--sniffer.merge_pdcch 0"
 set -uo pipefail
 
 OUT_DIR_DEFAULT="$PWD/multi-ue-test-out"
@@ -25,7 +26,7 @@ start_gnb_dci_logger
 start_gnb --T_stdout 2
 wait_for 60 "connected to" "$OUT_DIR/gnb_dci_logger.log" "$GNB_PID" || fail "nr-gnb-dci-logger did not connect to the gNB"
 wait_for 30 "Running as server" "$OUT_DIR/gnb.log" "$GNB_PID" || fail "the gNB did not start its rfsim server"
-start_sniffer --sniffer.out_dir "$SNIFF_DIR" --sniffer.max_ues "$NUM_UES"
+start_sniffer --sniffer.out_dir "$SNIFF_DIR" --sniffer.max_ues "$NUM_UES" ${SNIFFER_ARGS:-}
 wait_for 60 "Watching random access" "$OUT_DIR/sniffer.log" "$SNIFF_PID" \
   || fail "nr-sniffer did not decode SIB1 and start watching RA, see $OUT_DIR/sniffer.log"
 
@@ -40,6 +41,11 @@ done
 echo "$NUM_UES UEs connected; recording ${DURATION}s of DCIs"
 sleep "$DURATION"
 kill -0 "$SNIFF_PID" 2>/dev/null || echo "nr-sniffer exited early, see $OUT_DIR/sniffer.log"
+if [ -r "/proc/$SNIFF_PID/stat" ]; then  # utime + stime, in clock ticks
+  read -r cpu_ticks < <(awk '{ print $14 + $15 }' "/proc/$SNIFF_PID/stat")
+  echo "INFO nr-sniffer CPU time: $((cpu_ticks / $(getconf CLK_TCK))) s"
+fi
+grep "\[SNIFFER\] stats" "$OUT_DIR/sniffer.log" | tail -1
 cleanup
 STARTED_PIDS=()
 

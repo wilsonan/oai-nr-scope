@@ -58,10 +58,10 @@ class Run:
                        [dict(timestamp_us=T0, sfn=10, slot=10, rapid=35, timing_advance=0, ul_grant="0x0000000",
                              tc_rnti=f"0x{RNTI:04x}")] if rar else [])
         if ue_rows is None:
-            ue_rows = [dict(timestamp_us=T0, sfn=11, slot=10, c_rnti=f"0x{RNTI:04x}",
+            ue_rows = [dict(timestamp_us=T0, sfn=11, slot=10, c_rnti=f"0x{RNTI:04x}", event="follow",
                             contention_resolution_id="0x010203040506")]
-        self.write_csv(f"{d}/sniffer/ue.csv", ["timestamp_us", "sfn", "slot", "c_rnti", "contention_resolution_id"],
-                       ue_rows)
+        self.write_csv(f"{d}/sniffer/ue.csv", ["timestamp_us", "sfn", "slot", "c_rnti", "event",
+                                               "contention_resolution_id"], ue_rows)
         for name, text in (("gnb.log", gnb_log), ("ue.log", ue_log), ("sniffer.log", sniffer_log)):
             with open(f"{d}/{name}", "w") as f:
                 f.write(text)
@@ -173,8 +173,8 @@ class CompareDci(unittest.TestCase):
         g = [dci(n, fmt="1_1" if n % 2 else "0_1") for n in range(0, 8000, 5)]
         follow_us = T0 + 2_000_000
         s = [r for r in shifted(g, 3000) if r["timestamp_us"] >= follow_us - 100_000]
-        ue = [dict(timestamp_us=follow_us - 100_000, sfn=-1, slot=-1, c_rnti=f"0x{RNTI:04x}",
-                   contention_resolution_id="known")]
+        ue = [dict(timestamp_us=follow_us - 100_000, sfn=-1, slot=-1, c_rnti=f"0x{RNTI:04x}", event="known",
+                   contention_resolution_id="")]
         run = self.new(g, s, rar=False, ue_rows=ue, gnb_log="", ue_log="")
         rc, out = run.compare("--rnti", f"0x{RNTI:04x}")
         self.assertEqual(rc, 0, out)
@@ -209,8 +209,9 @@ def two_ue_run_inputs():
                 tc_rnti=f"0x{RNTI:04x}"),
            dict(timestamp_us=T0 + 2_000_000, sfn=210, slot=10, rapid=12, timing_advance=0, ul_grant="0x0000000",
                 tc_rnti=f"0x{RNTI2:04x}")]
-    ue = [dict(timestamp_us=T0, sfn=11, slot=10, c_rnti=f"0x{RNTI:04x}", contention_resolution_id="0x01"),
-          dict(timestamp_us=T0 + 2_000_000, sfn=211, slot=10, c_rnti=f"0x{RNTI2:04x}", contention_resolution_id="0x02")]
+    ue = [dict(timestamp_us=T0, sfn=11, slot=10, c_rnti=f"0x{RNTI:04x}", event="follow", contention_resolution_id="0x01"),
+          dict(timestamp_us=T0 + 2_000_000, sfn=211, slot=10, c_rnti=f"0x{RNTI2:04x}", event="follow",
+               contention_resolution_id="0x02")]
     return g, log, rar, ue
 
 
@@ -251,6 +252,37 @@ class CompareDciMultiUe(unittest.TestCase):
         rc, out = self.new(g, s, log, rar, ue).compare()
         self.assertIn(f"INFO UE 0x{RNTI2:04x}: 6/", out)
         self.assertIn("6/", out.split("DCI miss rate:")[1])
+
+    def test_report_files(self):
+        g, log, rar, ue = two_ue_run_inputs()
+        s = shifted(g, 3000)
+        mine = [i for i, r in enumerate(s) if r["rnti"] == f"0x{RNTI2:04x}"]
+        for i in sorted(mine[100:104], reverse=True):
+            del s[i]
+        run = self.new(g, s, log, rar, ue)
+        md, per_ue = f"{run.dir}/report.md", f"{run.dir}/per_ue.csv"
+        rc, out = run.compare("--report", md, "--report-csv", per_ue)
+        self.assertEqual(rc, 0, out)
+        report = open(md).read()
+        self.assertIn("Result: **PASS**", report)
+        self.assertIn(f"| 0x{RNTI:04x} | random access |", report)
+        self.assertIn("RESULT: PASS", report)
+        with open(per_ue) as f:
+            rows = {r["rnti"]: r for r in csv.DictReader(f)}
+        self.assertEqual(set(rows), {f"0x{RNTI:04x}", f"0x{RNTI2:04x}"})
+        self.assertEqual(rows[f"0x{RNTI2:04x}"]["missed"], "4")
+        self.assertEqual(rows[f"0x{RNTI:04x}"]["missed"], "0")
+        # 136-bit TBs: what the gNB scheduled and what the sniffer saw differ only by the missed DCIs
+        self.assertGreater(float(rows[f"0x{RNTI:04x}"]["gnb_ul_mbps"]), 0)
+        self.assertEqual(rows[f"0x{RNTI:04x}"]["gnb_ul_mbps"], rows[f"0x{RNTI:04x}"]["sniffer_ul_mbps"])
+
+    def test_left_row_is_not_a_follow(self):
+        g, log, rar, ue = two_ue_run_inputs()
+        ue = ue[:1] + [dict(timestamp_us=T0 + 1_000_000, sfn=-1, slot=-1, c_rnti=f"0x{RNTI2:04x}", event="left",
+                            contention_resolution_id="")]
+        s = [r for r in shifted(g, 3000) if r["rnti"] != f"0x{RNTI2:04x}"]
+        rc, out = self.new(g, s, log, rar, ue).compare()
+        self.assertIn(f"not followed: 0x{RNTI2:04x}", out)
 
     def test_stray_c_rnti_dci_is_a_false_positive(self):
         g, log, rar, ue = two_ue_run_inputs()

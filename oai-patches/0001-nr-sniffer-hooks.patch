@@ -32,10 +32,10 @@ index 954017a..23c7849 100644
  ID = ENB_RLC_DL
 diff --git a/common/utils/nr_sniffer_hooks.h b/common/utils/nr_sniffer_hooks.h
 new file mode 100644
-index 0000000..46e0ae0
+index 0000000..15ebe18
 --- /dev/null
 +++ b/common/utils/nr_sniffer_hooks.h
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,193 @@
 +/*
 + * SPDX-License-Identifier: LicenseRef-CSSL-1.0
 + */
@@ -127,6 +127,10 @@ index 0000000..46e0ae0
 +int nr_sniffer_shadow_instance(uint16_t rnti) __attribute__((weak));
 +/// UE MAC: the shadow MAC instances of all followed UEs (at most \p max). Returns their number.
 +int nr_sniffer_shadow_instances(int *instances, int max) __attribute__((weak));
++/// UE MAC: fold PDCCH configurations of followed UEs that differ only in the RNTI into one (--sniffer.merge_pdcch).
++bool nr_sniffer_merge_pdcch(void) __attribute__((weak));
++/// UE MAC, once per slot: \p nb_configs PDCCH configurations go to the PHY, \p nb_merged others were folded into them.
++void nr_sniffer_on_slot(int frame, int slot, int nb_configs, int nb_merged) __attribute__((weak));
 +/// UE SIB1 as last decoded (a const NR_SIB1_t *), to configure shadow MAC instances; NULL before SIB1.
 +const void *nr_sniffer_sib1(void) __attribute__((weak));
 +
@@ -204,6 +208,17 @@ index 0000000..46e0ae0
 +  return nr_sniffer_shadow_instances ? nr_sniffer_shadow_instances(instances, max) : 0;
 +}
 +
++static inline bool nr_sniffer_hook_merge_pdcch(void)
++{
++  return nr_sniffer_merge_pdcch && nr_sniffer_merge_pdcch();
++}
++
++static inline void nr_sniffer_hook_slot(int frame, int slot, int nb_configs, int nb_merged)
++{
++  if (nr_sniffer_on_slot)
++    nr_sniffer_on_slot(frame, slot, nb_configs, nb_merged);
++}
++
 +static inline const void *nr_sniffer_hook_get_sib1(void)
 +{
 +  return nr_sniffer_sib1 ? nr_sniffer_sib1() : NULL;
@@ -249,7 +264,7 @@ index e1e708e..d3e7aab 100644
  #define FAPI_NR_DL_CONFIG_TYPE_DCI 0x01
  #define FAPI_NR_DL_CONFIG_TYPE_DLSCH 0x02
 diff --git a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h b/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
-index ea3b90f..7060317 100644
+index ea3b90f..3af763e 100644
 --- a/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
 +++ b/nfapi/open-nFAPI/nfapi/public_inc/fapi_nr_ue_interface.h
 @@ -101,6 +101,9 @@ typedef struct {
@@ -262,17 +277,21 @@ index ea3b90f..7060317 100644
    uint8_t payloadSize;
    uint8_t payloadBits[16] __attribute__((aligned(16))); // will be cast as uint64
  } fapi_nr_dci_indication_pdu_t;
-@@ -436,6 +439,8 @@ typedef struct {
+@@ -436,6 +439,12 @@ typedef struct {
    uint8_t dci_length_options[2];
    nfapi_nr_dci_formats_e dci_format_options[2];
    uint8_t ss_type_options[2];
 +  int ss_id; // searchSpaceId, reported back in the DCI indication
 +  int coreset_id; // controlResourceSetId, reported back in the DCI indication
++  // nr-sniffer: other RNTIs monitored with exactly this configuration (same candidates, sizes and scrambling),
++  // so that their PDCCH is demodulated and decoded once (NR_SNIFFER_MAX_SHADOWS)
++  uint8_t num_extra_rnti;
++  uint16_t extra_rnti[16];
  } fapi_nr_dl_config_dci_dl_pdu_rel15_t;
  
  typedef struct {
 diff --git a/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c b/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
-index 2b773e3..7585368 100644
+index 2b773e3..b31247b 100644
 --- a/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
 +++ b/openair1/PHY/NR_UE_TRANSPORT/dci_nr.c
 @@ -13,6 +13,7 @@
@@ -283,17 +302,27 @@ index 2b773e3..7585368 100644
  #include "nr_transport_proto_ue.h"
  #include "PHY/CODING/nrPolar_tools/nr_polar_dci_defs.h"
  #include "PHY/phy_extern.h"
-@@ -495,6 +496,9 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
+@@ -495,6 +496,19 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
        const uint32_t crc = polar_decoder_int16(tmp_e, dci_estimation, 1, NR_POLAR_DCI_MESSAGE_TYPE, dci_length, L);
  
        rnti_t n_rnti = rel15->rnti;
-+      // nr-sniffer: also accept the candidate if its CRC remainder is another UE's RNTI that the sniffer tracks
-+      if (crc != n_rnti && nr_sniffer_hook_match_rnti(rel15->rnti, crc))
-+        n_rnti = crc;
++      // nr-sniffer: also accept the candidate if its CRC remainder is another UE's RNTI that the sniffer tracks,
++      // or one of the other RNTIs monitored with this very configuration
++      if (crc != n_rnti) {
++        for (int e = 0; e < rel15->num_extra_rnti; e++)
++          if (crc == rel15->extra_rnti[e])
++            n_rnti = crc;
++        if (crc != n_rnti && nr_sniffer_hook_match_rnti(rel15->rnti, crc))
++          n_rnti = crc;
++        // already found at another aggregation level: the pre-check above only knows rel15->rnti
++        for (int d = 0; d < dci_ind->number_of_dcis && crc == n_rnti; d++)
++          if (!is_SI && dci_ind->dci_list[d].rnti == n_rnti && dci_ind->dci_list[d].payloadSize == dci_length)
++            n_rnti = rel15->rnti; // != crc: this candidate is skipped
++      }
        if (crc == n_rnti) {
          LOG_D(NR_PHY_DCI,
                "(%i.%i) Received dci indication (rnti %x,dci format %d,n_CCE %d,payloadSize %d,payload %llx)\n",
-@@ -514,6 +518,8 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
+@@ -514,6 +528,8 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
              .dci_format = rel15->dci_format_options[k],
              .ss_type = rel15->ss_type_options[k],
              .coreset_type = rel15->coreset.CoreSetType,
@@ -330,7 +359,7 @@ index 1a8b22e..6e8c3da 100644
      switch (pdu->pdu_type) {
        case FAPI_NR_UL_CONFIG_TYPE_PUSCH: {
 diff --git a/openair2/LAYER2/NR_MAC_UE/config_ue.c b/openair2/LAYER2/NR_MAC_UE/config_ue.c
-index aad37a4..d9e5efe 100644
+index aad37a4..aa3309d 100644
 --- a/openair2/LAYER2/NR_MAC_UE/config_ue.c
 +++ b/openair2/LAYER2/NR_MAC_UE/config_ue.c
 @@ -9,6 +9,7 @@
@@ -341,7 +370,7 @@ index aad37a4..d9e5efe 100644
  #include "NR_MAC_UE/mac_proto.h"
  #include "NR_MAC-CellGroupConfig.h"
  #include "LAYER2/NR_MAC_COMMON/nr_mac_common.h"
-@@ -2949,6 +2950,79 @@ static void handle_mac_uecap_info(NR_UE_MAC_INST_t *mac, NR_UE_NR_Capability_t *
+@@ -2949,6 +2950,91 @@ static void handle_mac_uecap_info(NR_UE_MAC_INST_t *mac, NR_UE_NR_Capability_t *
    }
  }
  
@@ -383,7 +412,19 @@ index aad37a4..d9e5efe 100644
 +  }
 +  NR_UE_MAC_INST_t *mac = get_mac_inst(instance);
 +  if (mac) {
-+    LOG_E(NR_MAC, "nr-sniffer: MAC instance %d is already in use, not following C-RNTI %04x\n", instance, rnti);
++    if (!mac->sniffer_shadow) {
++      LOG_E(NR_MAC, "nr-sniffer: MAC instance %d is not a shadow instance, not following C-RNTI %04x\n", instance, rnti);
++      return;
++    }
++    /* reused for another UE: drop the previous UE's dedicated configuration, keep the cell's */
++    LOG_I(NR_MAC, "nr-sniffer: reusing shadow MAC instance %d for C-RNTI %04x\n", instance, rnti);
++    nr_rrc_mac_config_req_reset(instance, GO_TO_IDLE_KEEP_CAMPED);
++    nr_ue_mac_flush_ul_config(mac);
++    for (int slot = 0; slot < mac->frame_structure.numb_slots_frame; slot++)
++      get_dl_config_request(mac, slot)->number_pdus = 0;
++    nr_rrc_mac_config_req_cg(instance, 0, 0, 0, cell_group, NULL);
++    mac->update_pdcch_config = true;
++    nr_ue_mac_follow_rnti(instance, rnti);
 +    return;
 +  }
 +  mac = nr_l2_init_ue(instance, main->numerology, main->rx2tx_capability);
@@ -435,10 +476,10 @@ index c399cc8..e2f1825 100644
  
  static inline int GET_NTN_UE_K_OFFSET(const fapi_nr_ntn_config_t *ntn_ta, int scs)
 diff --git a/openair2/LAYER2/NR_MAC_UE/mac_proto.h b/openair2/LAYER2/NR_MAC_UE/mac_proto.h
-index dd2ab39..d80a990 100644
+index dd2ab39..a391589 100644
 --- a/openair2/LAYER2/NR_MAC_UE/mac_proto.h
 +++ b/openair2/LAYER2/NR_MAC_UE/mac_proto.h
-@@ -56,6 +56,14 @@ void release_dl_BWP(NR_UE_MAC_INST_t *mac, int index);
+@@ -56,6 +56,17 @@ void release_dl_BWP(NR_UE_MAC_INST_t *mac, int index);
  void release_ul_BWP(NR_UE_MAC_INST_t *mac, int index);
  void nr_release_mac_config_logicalChannelBearer(NR_UE_MAC_INST_t *mac, long channel_identity);
  
@@ -447,6 +488,9 @@ index dd2ab39..d80a990 100644
 +/// nr-sniffer: create shadow MAC instance \p instance for another UE: the cell configuration of \p main (MIB, SIB1)
 +/// plus that UE's \p cell_group, and C-RNTI \p rnti. The shadow has no PHY or RRC; it only parses that UE's DCIs.
 +void nr_ue_mac_follow_shadow(NR_UE_MAC_INST_t *main, int instance, uint16_t rnti, NR_CellGroupConfig_t *cell_group);
++/// nr-sniffer: PDCCH configurations in dl_config from index \p first_new on that equal an earlier one except for
++/// the RNTI are folded into it (its extra_rnti list) and removed. Returns how many were folded.
++int nr_ue_merge_dci_configs(fapi_nr_dl_config_request_t *dl_config, int first_new);
 +/// nr-sniffer: drop every UL configuration a shadow MAC instance prepared (it never transmits)
 +void nr_ue_mac_flush_ul_config(NR_UE_MAC_INST_t *mac);
 +
@@ -475,7 +519,7 @@ index b725793..a854191 100644
    mac->state = UE_PERFORMING_RA;
    reset_ra(mac, false);
 diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
-index ad89949..46d2af7 100644
+index ad89949..ba97c01 100644
 --- a/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
 +++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_dci_configuration.c
 @@ -13,6 +13,7 @@
@@ -486,16 +530,78 @@ index ad89949..46d2af7 100644
  #include <stdio.h>
  
  static void fill_dci_search_candidates(const NR_SearchSpace_t *ss, fapi_nr_dl_config_dci_dl_pdu_rel15_t *rel15, const uint32_t Y)
-@@ -115,6 +116,8 @@ static void config_dci_pdu(NR_UE_MAC_INST_t *mac,
+@@ -115,6 +116,9 @@ static void config_dci_pdu(NR_UE_MAC_INST_t *mac,
    }
  
    rel15->coreset.duration = coreset->duration;
 +  rel15->coreset_id = coreset_id;
 +  rel15->ss_id = ss->searchSpaceId;
++  rel15->num_extra_rnti = 0;
  
    for (int i = 0; i < 6; i++)
      rel15->coreset.frequency_domain_resource[i] = coreset->frequencyDomainResources.buf[i];
-@@ -568,6 +571,16 @@ void ue_dci_configuration(NR_UE_MAC_INST_t *mac, fapi_nr_dl_config_request_t *dl
+@@ -325,6 +329,60 @@ static void config_dci_pdu(NR_UE_MAC_INST_t *mac,
+   dl_config->number_pdus += 1;
+ }
+ 
++/* nr-sniffer: true if PDCCH configurations a and b differ at most in their RNTI: same CORESET, scrambling,
++ * candidates and DCI sizes, so one demodulation and one polar decoding per candidate serve both */
++static bool same_pdcch_config(const fapi_nr_dl_config_dci_dl_pdu_rel15_t *a, const fapi_nr_dl_config_dci_dl_pdu_rel15_t *b)
++{
++  const fapi_nr_coreset_t *ca = &a->coreset, *cb = &b->coreset;
++  if (a->BWPSize != b->BWPSize || a->BWPStart != b->BWPStart || a->SubcarrierSpacing != b->SubcarrierSpacing
++      || a->ss_id != b->ss_id || a->coreset_id != b->coreset_id || a->number_of_candidates != b->number_of_candidates
++      || a->num_dci_options != b->num_dci_options)
++    return false;
++  if (memcmp(ca->frequency_domain_resource, cb->frequency_domain_resource, sizeof(ca->frequency_domain_resource))
++      || ca->rb_offset != cb->rb_offset || ca->StartSymbolBitmap != cb->StartSymbolBitmap || ca->duration != cb->duration
++      || ca->CceRegMappingType != cb->CceRegMappingType || ca->RegBundleSize != cb->RegBundleSize
++      || ca->InterleaverSize != cb->InterleaverSize || ca->ShiftIndex != cb->ShiftIndex || ca->CoreSetType != cb->CoreSetType
++      || ca->precoder_granularity != cb->precoder_granularity || ca->pdcch_dmrs_scrambling_id != cb->pdcch_dmrs_scrambling_id
++      || ca->scrambling_rnti != cb->scrambling_rnti)
++    return false;
++  for (int i = 0; i < a->number_of_candidates; i++)
++    if (a->CCE[i] != b->CCE[i] || a->L[i] != b->L[i])
++      return false;
++  for (int i = 0; i < a->num_dci_options; i++)
++    if (a->dci_length_options[i] != b->dci_length_options[i] || a->dci_format_options[i] != b->dci_format_options[i]
++        || a->ss_type_options[i] != b->ss_type_options[i])
++      return false;
++  return true;
++}
++
++int nr_ue_merge_dci_configs(fapi_nr_dl_config_request_t *dl_config, int first_new)
++{
++  int merged = 0;
++  int out = first_new;
++  for (int k = first_new; k < dl_config->number_pdus; k++) {
++    fapi_nr_dl_config_request_pdu_t *pdu = &dl_config->dl_config_list[k];
++    bool done = false;
++    if (pdu->pdu_type == FAPI_NR_DL_CONFIG_TYPE_DCI) {
++      const fapi_nr_dl_config_dci_dl_pdu_rel15_t *rel15 = &pdu->dci_config_pdu.dci_config_rel15;
++      for (int j = 0; j < first_new && !done; j++) {
++        fapi_nr_dl_config_request_pdu_t *prev = &dl_config->dl_config_list[j];
++        fapi_nr_dl_config_dci_dl_pdu_rel15_t *p = &prev->dci_config_pdu.dci_config_rel15;
++        if (prev->pdu_type != FAPI_NR_DL_CONFIG_TYPE_DCI || p->num_extra_rnti >= sizeofArray(p->extra_rnti)
++            || p->rnti == rel15->rnti || !same_pdcch_config(p, rel15))
++          continue;
++        p->extra_rnti[p->num_extra_rnti++] = rel15->rnti;
++        done = true;
++      }
++    }
++    if (done)
++      merged++;
++    else
++      dl_config->dl_config_list[out++] = *pdu;
++  }
++  dl_config->number_pdus = out;
++  return merged;
++}
++
+ bool is_ss_monitor_occasion(const int frame, const int slot, const int slots_per_frame, const NR_SearchSpace_t *ss)
+ {
+   if (!ss)
+@@ -568,6 +626,16 @@ void ue_dci_configuration(NR_UE_MAC_INST_t *mac, fapi_nr_dl_config_request_t *dl
      }
    }
    RA_config_t *ra = &mac->ra;
@@ -732,7 +838,7 @@ index d7d1031..92afb2c 100644
          break;
        }
 diff --git a/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c b/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
-index 45ff543..7656089 100644
+index 45ff543..cc9be53 100644
 --- a/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
 +++ b/openair2/LAYER2/NR_MAC_UE/nr_ue_scheduler.c
 @@ -15,6 +15,7 @@
@@ -743,7 +849,7 @@ index 45ff543..7656089 100644
  #include "NR_MAC_COMMON/nr_mac_common.h"
  #include "NR_MAC_UE/mac_proto.h"
  
-@@ -1328,6 +1329,23 @@ void nr_ue_dl_scheduler(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info
+@@ -1328,6 +1329,34 @@ void nr_ue_dl_scheduler(NR_UE_MAC_INST_t *mac, nr_downlink_indication_t *dl_info
  
    ue_dci_configuration(mac, dl_config, rx_frame, rx_slot);
  
@@ -751,6 +857,7 @@ index 45ff543..7656089 100644
 +  // DMRS scrambling, DCI sizes of that UE), are decoded by this UE's PHY in the same PDCCH pass
 +  int shadows[NR_SNIFFER_MAX_SHADOWS];
 +  const int nb_shadows = nr_sniffer_hook_shadow_instances(shadows, NR_SNIFFER_MAX_SHADOWS);
++  int nb_merged = 0;
 +  for (int i = 0; i < nb_shadows; i++) {
 +    if (dl_config->number_pdus > FAPI_NR_DL_CONFIG_LIST_NUM - 4) { // keep room for this UE's own PDSCH PDUs
 +      LOG_W(NR_MAC, "nr-sniffer: %d.%d DL config full, not monitoring %d followed UEs\n", rx_frame, rx_slot, nb_shadows - i);
@@ -760,8 +867,18 @@ index 45ff543..7656089 100644
 +    if (!shadow)
 +      continue;
 +    verifyMutex(pthread_mutex_lock(&shadow->if_mutex));
++    const int first_new = dl_config->number_pdus;
 +    ue_dci_configuration(shadow, dl_config, rx_frame, rx_slot);
 +    verifyMutex(pthread_mutex_unlock(&shadow->if_mutex));
++    // the common search spaces of all followed UEs are identical but for the RNTI: decode them once
++    if (nr_sniffer_hook_merge_pdcch())
++      nb_merged += nr_ue_merge_dci_configs(dl_config, first_new);
++  }
++  if (!mac->sniffer_shadow) {
++    int nb_configs = 0;
++    for (int i = 0; i < dl_config->number_pdus; i++)
++      nb_configs += dl_config->dl_config_list[i].pdu_type == FAPI_NR_DL_CONFIG_TYPE_DCI;
++    nr_sniffer_hook_slot(rx_frame, rx_slot, nb_configs, nb_merged);
 +  }
 +
    if (mac->ul_time_alignment.ta_apply != no_ta)

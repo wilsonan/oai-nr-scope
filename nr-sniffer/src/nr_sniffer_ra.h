@@ -19,8 +19,9 @@
 #define NR_SNIFFER_MAX_UES 14
 
 /// Open rar.csv and ue.csv in \p out_dir. \p follow: 0 disables RA tracking (milestone 1 behaviour).
-/// \p max_ues: how many UEs to follow at most (capped at NR_SNIFFER_MAX_UES).
-void nr_sniffer_ra_init(const char *out_dir, bool follow, int max_ues);
+/// \p max_ues: how many UEs to follow at once at most (capped at NR_SNIFFER_MAX_UES). \p ue_timeout_s: a UE
+/// without a DCI for that long is no longer followed and its shadow MAC instance is reused (0: never).
+void nr_sniffer_ra_init(const char *out_dir, bool follow, int max_ues, double ue_timeout_s);
 /// Forget all tracked RNTIs, followed UEs, known configurations and SIB1 (unit tests; output files stay open).
 void nr_sniffer_ra_reset(void);
 /// Compute the RA-RNTIs of the cell from SIB1 (\p sib1 is a const NR_SIB1_t *) and keep a copy of it.

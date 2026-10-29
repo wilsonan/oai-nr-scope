@@ -6,3 +6,5 @@ phytest-dci-test-out/
 known-ue-test-out/
 __pycache__/
 multi-ue-test-out/
+ue-reuse-test-out/
+multi-ue-test-out-*/
