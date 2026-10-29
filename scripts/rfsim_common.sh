@@ -30,25 +30,9 @@ if others_running; then
   exit 1
 fi
 
-# The gNB runs without a core network: point its NG interface at localhost so it starts cleanly.
-TEST_CONF="$OUT_DIR/gnb.conf"
-sed -E 's/(ipv4[[:space:]]*=[[:space:]]*")[0-9.]+(")/\1127.0.0.1\2/;
-        s/(GNB_IPV4_ADDRESS_FOR_N[GU][_A-Z]*[[:space:]]*=[[:space:]]*")[0-9.]+(\/[0-9]+)?(")/\1127.0.0.1\3/' \
-    "$GNB_CONF" > "$TEST_CONF"
-
-# Derive the UE/sniffer tuning arguments from the gNB config.
-read -r DL_FREQ NRB MU BAND < <(python3 - "$TEST_CONF" <<'EOF'
-import re, sys
-t = re.sub(r"#.*", "", open(sys.argv[1]).read())
-v = lambda k: int(re.search(r"\b" + k + r"\s*=\s*([-0-9]+)", t).group(1))
-def khz(n):
-    return 5 * n if n < 600000 else 3_000_000 + 15 * (n - 600000) if n < 2016667 else 24_250_080 + 60 * (n - 2016667)
-mu, nrb = v("dl_subcarrierSpacing"), v("dl_carrierBandwidth")
-band = v("dl_frequencyBand") if "dl_frequencyBand" in t else v("ul_frequencyBand")
-center = khz(v("dl_absoluteFrequencyPointA")) + (v("dl_offstToCarrier") + nrb / 2) * 12 * (15 << mu)
-print(int(center * 1000), nrb, mu, band)
-EOF
-)
+# gnb.conf for running without a core network, and the tuning derived from it (see rfsim_conf.sh)
+eval "$(OAI_DIR="$OAI_DIR" "$REPO_DIR/scripts/rfsim_conf.sh" "$OUT_DIR" "$GNB_CONF")"
+TEST_CONF="$GNB_CONF_RFSIM"
 echo "Cell under test: DL centre ${DL_FREQ} Hz, ${NRB} PRB, numerology ${MU}, band n${BAND}"
 TUNING=(-r "$NRB" --numerology "$MU" --band "$BAND" -C "$DL_FREQ" --rfsim --rfsimulator.[0].serveraddr 127.0.0.1)
 

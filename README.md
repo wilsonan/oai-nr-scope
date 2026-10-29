@@ -67,6 +67,12 @@ NUM_UES=3 scripts/multi_ue_test.sh      # several UEs attaching one after the ot
 scripts/ue_reuse_test.sh                # a UE leaves; its shadow MAC instance follows the next UE
 ```
 
+To try it yourself, run `scripts/rfsim_demo.sh --ues 2`. It starts a gNB, the ground-truth logger,
+the sniffer and two UEs in the RF simulator, then shows the live view. Press Ctrl-C to stop it and
+write `rfsim-demo/report.md`. The [tutorials](tutorials/) cover this step by step: running each
+program in its own terminal, what every output means, phy-test traffic and following a UE that is
+already connected.
+
 ## Tests
 
 `scripts/unit_tests.sh` takes a few seconds and needs no radio or rfsim. Run it after every change:

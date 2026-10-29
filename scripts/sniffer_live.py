@@ -8,7 +8,7 @@ Usage: sniffer_live.py <sniffer out_dir | dci CSV> [--window 1.0] [--interval 1.
   --window S         statistics over the last S seconds (default 1)
   --once             no live view: print one summary over the whole file and exit
 
-Per RNTI it shows the DCIs decoded (DL/UL), mean PRBs and MCS, retransmissions (rv != 0), and the
+Per RNTI it shows the DCIs decoded (DL/UL), mean PRBs and MCS index (DL and UL), retransmissions (rv != 0), and the
 scheduled throughput (transport-block bits per second, including retransmissions). Timestamps are
 the sniffer's wall clock, so with the RF simulator, which runs slower or faster than real time, the
 Mbit/s are per wall-clock second, not per second of air time.
@@ -17,6 +17,7 @@ import argparse
 import csv
 import io
 import os
+import signal
 import sys
 import time
 
@@ -88,23 +89,23 @@ def cell_lines(out_dir):
 def table(rows, seconds):
     stats = {}
     for r in rows:
-        s = stats.setdefault((r["rnti"], r["rnti_type"]), {"dl": 0, "ul": 0, "dl_prb": 0, "ul_prb": 0, "mcs": 0,
-                                                           "retx": 0, "dl_bits": 0, "ul_bits": 0, "formats": set()})
+        s = stats.setdefault((r["rnti"], r["rnti_type"]), {"dl": 0, "ul": 0, "dl_prb": 0, "ul_prb": 0, "dl_mcs": 0,
+                                                           "ul_mcs": 0, "retx": 0, "dl_bits": 0, "ul_bits": 0,
+                                                           "formats": set()})
         d = r["direction"]
         s[d] += 1
         s[d + "_prb"] += int(r["prb_len"])
         s[d + "_bits"] += int(r["tbs_bits"])
-        s["mcs"] += int(r["mcs"])
+        s[d + "_mcs"] += int(r["mcs"])
         s["retx"] += r["rv"] != "0"
         s["formats"].add(r["dci_format"])
     out = [f"{'RNTI':8} {'type':5} {'formats':9} {'DL DCI':>7} {'UL DCI':>7} {'DL PRB':>7} {'UL PRB':>7} "
-           f"{'MCS':>5} {'reTx':>5} {'DL Mbit/s':>10} {'UL Mbit/s':>10}"]
+           f"{'DL MCS':>6} {'UL MCS':>6} {'reTx':>5} {'DL Mbit/s':>10} {'UL Mbit/s':>10}"]
     for (rnti, kind), s in sorted(stats.items(), key=lambda kv: (kv[0][1] != "c", kv[0][0])):
-        n = s["dl"] + s["ul"]
+        mean = lambda key, d: f"{s[key] / s[d]:.1f}" if s[d] else "-"
         out.append(f"{rnti:8} {kind:5} {','.join(sorted(s['formats'])):9} {s['dl']:7} {s['ul']:7} "
-                   f"{s['dl_prb'] / s['dl'] if s['dl'] else 0:7.1f} {s['ul_prb'] / s['ul'] if s['ul'] else 0:7.1f} "
-                   f"{s['mcs'] / n:5.1f} {s['retx']:5} {s['dl_bits'] / seconds / 1e6:10.3f} "
-                   f"{s['ul_bits'] / seconds / 1e6:10.3f}")
+                   f"{mean('dl_prb', 'dl'):>7} {mean('ul_prb', 'ul'):>7} {mean('dl_mcs', 'dl'):>6} {mean('ul_mcs', 'ul'):>6} "
+                   f"{s['retx']:5} {s['dl_bits'] / seconds / 1e6:10.3f} {s['ul_bits'] / seconds / 1e6:10.3f}")
     if len(out) == 1:
         out.append("(no DCI in this window)")
     return out
@@ -151,6 +152,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # Ctrl-C and SIGTERM end the live view, also when the shell started it with SIGINT ignored
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         sys.exit(main())
     except KeyboardInterrupt:
